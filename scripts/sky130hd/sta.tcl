@@ -1,3 +1,6 @@
+set sky130hd_platform /OpenROAD-flow-scripts/flow/platforms/sky130hd
+read_lef -tech $sky130hd_platform/lef/sky130_fd_sc_hd.tlef
+read_lef -library $sky130hd_platform/lef/sky130_fd_sc_hd_merged.lef
 read_liberty $::env(SKY130HD_LIB)
 read_verilog build/sky130hd/grider_tile_mapped.v
 link_design grider_tile
