@@ -42,7 +42,6 @@ read_verilog -defer -sv rtl/grider_tile.sv
 hierarchy -check -chparam TILE_W 1 -chparam TILE_H 1 -chparam LANES 1 -top grider_tile
 proc
 opt
-flatten
 memory_dff
 memory_share
 memory_collect
@@ -83,3 +82,4 @@ docker run --rm \
   2>&1 | tee build/sky130hd/sta.log
 python3 scripts/sky130hd/summarize.py
 cat build/sky130hd/report.md >> "$GITHUB_STEP_SUMMARY"
+
