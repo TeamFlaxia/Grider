@@ -50,9 +50,9 @@ for cell in memories:
         memory_shapes.append(f"{size} words × {width} bit")
         memory_dimensions.append((size, width))
 
-if sum(1 for size, width in memory_dimensions if size == 16 and width == 132) < 2:
+if sum(1 for size, width in memory_dimensions if size == 16 and width == 132) != 2:
     raise SystemExit(
-        "Expected separate 16×132 abstract memories for the register file and local SRAM"
+        "Expected two separate 16×132 abstract memories for the register file and local SRAM"
     )
 
 mapped_cells = list(all_cells(mapped))
@@ -104,6 +104,7 @@ abstract_memory = (
     f"{len(memories)} cell(s), {memory_bits} bit(s) ({', '.join(memory_shapes)})"
     if memories else "0 cells (RTL arrays were not retained as abstract Yosys memories)"
 )
+
 report = f"""# Sky130HD staged-memory estimate: one PE
 
 | Measurement | Result |

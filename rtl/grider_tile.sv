@@ -1,6 +1,51 @@
 // A one-port synchronous memory. Contents are not reset; a small valid bitmap
 // gives each word the architectural reset value until its first write.
-module grider_sram_1rw #(
+module grider_register_file_1rw #(
+    parameter integer DEPTH = 16,
+    parameter integer ADDR_WIDTH = 4
+) (
+    input  logic                 clk,
+    input  logic                 rst_n,
+    input  logic                 port_enable,
+    input  logic                 port_write,
+    input  logic [ADDR_WIDTH-1:0] port_address,
+    input  logic [131:0]         port_write_data,
+    output logic [131:0]         port_read_data
+);
+    logic [131:0] mem [0:DEPTH-1];
+    logic [DEPTH-1:0] valid;
+    logic [131:0] read_data_q;
+    logic read_valid_q;
+
+    always_ff @(posedge clk) begin
+        if (port_enable && (port_address < DEPTH)) begin
+            if (port_write)
+                mem[port_address] <= port_write_data;
+            else
+                read_data_q <= mem[port_address];
+        end
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            valid <= '0;
+            read_valid_q <= 1'b0;
+        end else if (port_enable && (port_address < DEPTH)) begin
+            if (port_write)
+                valid[port_address] <= 1'b1;
+            else
+                read_valid_q <= valid[port_address];
+        end else if (port_enable && !port_write) begin
+            read_valid_q <= 1'b0;
+        end
+    end
+
+    assign port_read_data = read_valid_q ? read_data_q : {4'h4, 128'b0};
+endmodule
+
+// A one-port synchronous memory. Contents are not reset; a small valid bitmap
+// gives each word the architectural reset value until its first write.
+module grider_local_sram_1rw #(
     parameter integer DEPTH = 16,
     parameter integer ADDR_WIDTH = 4
 ) (
@@ -314,7 +359,7 @@ module grider_tile #(
     genvar memory_lane;
     generate
         for (memory_lane = 0; memory_lane < LANES; memory_lane = memory_lane + 1) begin : lane_memories
-            grider_sram_1rw #(.DEPTH(REG_COUNT), .ADDR_WIDTH(4)) register_file (
+            grider_register_file_1rw #(.DEPTH(REG_COUNT), .ADDR_WIDTH(4)) register_file (
                 .clk(clk), .rst_n(rst_n),
                 .port_enable(rf_port_enable[memory_lane]),
                 .port_write(rf_port_write[memory_lane]),
@@ -322,7 +367,7 @@ module grider_tile #(
                 .port_write_data(rf_port_write_data[memory_lane]),
                 .port_read_data(rf_port_read_data[memory_lane])
             );
-            grider_sram_1rw #(.DEPTH(SRAM_WORDS), .ADDR_WIDTH(4)) local_sram (
+            grider_local_sram_1rw #(.DEPTH(SRAM_WORDS), .ADDR_WIDTH(4)) local_sram (
                 .clk(clk), .rst_n(rst_n),
                 .port_enable(sram_port_enable[memory_lane]),
                 .port_write(sram_port_write[memory_lane]),
