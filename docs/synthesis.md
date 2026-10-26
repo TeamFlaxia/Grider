@@ -29,18 +29,30 @@ The mapped flip-flop count matches the 4,224 architectural state bits plus the r
 
 ## Current synchronous-memory RTL
 
-The RTL packs the payload and type tag into one word, uses a synchronous read/write port per memory, and keeps reset state in a valid bitmap. A command reads its sources serially, captures the result, and writes back before another command is accepted. This adds instruction latency while separating memory access from arithmetic.
+The RTL packs the payload and type tag into one word, uses a synchronous read/write port per memory, and keeps reset state in a valid bitmap. A command reads its sources, executes, and writes back before another command is accepted. Reads, execution, and writeback occupy separate stages, but the stages do not overlap different instructions.
 
-The standard-cell-only Sky130HD flow does not include an SRAM macro Liberty/LEF, so mapped area still includes a flop implementation of each inferred memory. A real macro-level area comparison requires a compatible macro model and physical abstract.
+The Sky130HD run checked one PE (`TILE_W=1`, `TILE_H=1`, `LANES=1`) and found two abstract 16×132 memories for the register file and local SRAM. Six small one-bit memories also remain for control state. The standard-cell-only flow has no SRAM macro model, so it expands the memory arrays into standard cells.
+
+| Measurement | Current staged RTL | Earlier RTL |
+|---|---:|---:|
+| Mapped standard-cell area | 780,806.36 µm² | 785,977.56 µm² |
+| Standard-cell instances | 104,691 | 106,705 |
+| Sequential-cell instances | 5,477 | 4,225 |
+| Abstract 16×132 memories | 2 | 0 |
+| SRAM/RAM macro instances | 0 | 0 |
+| Worst slack at a 100 ns clock | 10.2986 ns | 29.9661 ns |
+| Derived pre-layout Fmax | 11.148 MHz | 14.279 MHz |
+
+The area fell by about 0.7%, while the estimated Fmax fell by about 22%. The result confirms memory inference, but it does not demonstrate the timing benefit of a physical SRAM macro. A macro-level result needs a matching macro Liberty/LEF and a memory compiler.
 
 ## Timing and area interpretation
 
-Yosys reports the sum of mapped standard-cell areas. The result excludes placement-only cells, clock-tree cells, routing, and physical-design overhead. The mapped netlist contains 4,225 flip-flops and a large combinational arithmetic network. The critical path has 69.9279 ns data arrival and traverses large mux cells followed by a long XOR/majority-cell chain. This is consistent with the register selection and arithmetic datapath; internal signal names are anonymized in the STA netlist, so the report does not identify a specific opcode.
+Yosys reports the sum of mapped standard-cell areas. The current netlist contains 5,477 sequential cells, including enabled flip-flops; the earlier count of 4,225 came from the old RTL. The current worst path has 88.3604 ns data arrival and 10.2986 ns slack. The RTL names are hidden in the STA netlist, so this report does not tie that path to a specific source signal.
 
-OpenSTA uses a 100 ns ideal clock, 100 ps clock transition, and zero clock uncertainty. Fmax is calculated as `1000 / (100 ns - worst slack)`. No placed design or extracted SPEF parasitics are supplied, so 14.279 MHz is a pre-layout estimate, not routed Fmax. The result covers one PE only; the default 16×16 tile and 2×2 mesh have not been synthesized for area or timing.
+OpenSTA uses a 100 ns ideal clock, 100 ps clock transition, and zero clock uncertainty. Fmax is calculated as `1000 / (100 ns - worst slack)`. No placed design or extracted SPEF parasitics are supplied, so 11.148 MHz is a pre-layout estimate, not routed Fmax. The result covers one PE only; the default 16×16 tile and 2×2 mesh have not been synthesized for area or timing.
 
 The flow pins the Sky130HD timing Liberty to PDK repository commit `5a42fd01a0eeb2338340438443c7062e198d97a4` and the OpenROAD Flow container to image digest `sha256:6810dbf0e03dddbc89ed8c0a1e13cad09ce4c98d40c4ac0ab99fdc04b0676347`. The CI artifact contains the reports, Yosys JSON snapshots, and mapped Verilog.
 
 ## Architectural implications
 
-The current RTL now describes each register file and local SRAM as a 16×132 single-port synchronous memory and separates operand reads, execution, and writeback. The Sky130HD flow still maps to a standard-cell Liberty without SRAM macro models, so it can verify abstract memory inference and compare area/Fmax but cannot show the benefit of a physical SRAM macro. The updated flow checks for two 16×132 abstract memories; its post-change report will be attached to the PR Actions run.
+The current RTL describes each register file and local SRAM as a 16×132 single-port synchronous memory and separates operand reads, execution, and writeback. The Sky130HD flow verifies that both memories are inferred, then maps them to standard cells because no SRAM macro model is supplied. The post-change estimate is 780,806.36 µm² and 11.148 MHz for one PE; timing is lower than the previous baseline and needs a later optimization pass.

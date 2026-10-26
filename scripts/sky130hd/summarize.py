@@ -63,7 +63,7 @@ mapped_ram_cells = [
 ]
 flop_count = sum(
     1 for cell in mapped_cells
-    if cell.get("type", "").startswith("sky130_fd_sc_hd__df")
+    if re.match(r"sky130_fd_sc_hd__(?:df|edf|sdf|sedf)", cell.get("type", ""))
 )
 
 stat = (OUT / "mapped-stat.txt").read_text()
@@ -133,3 +133,4 @@ report = f"""# Sky130HD staged-memory estimate: one PE
 """
 (OUT / "report.md").write_text(report)
 print(report)
+
