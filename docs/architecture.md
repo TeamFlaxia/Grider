@@ -35,7 +35,7 @@ BF16 MAC rounds the product to BF16 and then rounds the accumulated sum to BF16.
 | `NEIGHBOR` | copy one of eight adjacent cell values |
 | `LOAD`, `STORE` | read/write one word of each active cell's local SRAM |
 
-An instruction carries `opcode`, destination/source register indices, a 128-bit immediate, a type selector, and a 256-bit lane mask. The type selector `0xf` means inherit the first source's type (or `src_b` for `SEL`). `LOAD`/`STORE` use `imm[3:0]` as the local SRAM word index; `NEIGHBOR` uses `imm[2:0]` as its direction.
+An instruction carries `opcode`, destination/source register indices, a 128-bit immediate, a type selector, and a 256-bit lane mask. The type selector `0xf` inherits `src_a`'s type, or `src_b` for `SEL`. The complete type, reserved-encoding, immediate, and operation rules are in [docs/isa.md](isa.md). `LOAD`/`STORE` use `imm[3:0]`; `NEIGHBOR` uses `imm[2:0]`.
 
 ## Python and RTL contract
 
