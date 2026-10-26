@@ -439,6 +439,10 @@ module grider_tile #(
             lane_b[lane] = rf_data[lane][src_b];
             lane_c[lane] = rf_data[lane][src_c];
             lane_acc[lane] = rf_data[lane][dst];
+            signed_a = '0;
+            signed_b = '0;
+            signed_min_a = '0;
+            signed_min_b = '0;
             if (opcode == OP_SEL) begin
                 lane_dtype[lane] = (dtype == DT_INHERIT) ? rf_type[lane][src_b] : dtype;
             end else if (opcode == OP_LOAD) begin
