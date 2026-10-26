@@ -21,6 +21,9 @@ module tb_grider_mesh;
     reg [3:0] dtype = '0;
     reg [LANES-1:0] lane_mask = '1;
     reg host_write_enable = 1'b0;
+    reg host_read_enable = 1'b0;
+    wire host_access_ready;
+    wire host_read_valid;
     reg host_memory_select = 1'b0;
     reg [7:0] host_tile_x = '0;
     reg [7:0] host_tile_y = '0;
@@ -38,18 +41,41 @@ module tb_grider_mesh;
                               input logic [127:0] data, input logic [3:0] tag);
         begin
             @(negedge clk);
+            host_read_enable = 1'b0;
             host_write_enable = 1'b1;
             host_tile_x = tx[7:0]; host_tile_y = ty[7:0];
             host_memory_select = 1'b0;
             host_lane = lane[7:0]; host_index = index[3:0];
             host_write_data = data; host_write_type = tag;
             #1;
-            if (instruction_ready !== 1'b0)
-                $fatal(1, "mesh host write must deassert instruction_ready");
+            if (instruction_ready !== 1'b0 || host_access_ready !== 1'b1)
+                $fatal(1, "mesh host write must own an idle state port");
             @(posedge clk); #1;
-            if (instruction_done !== 1'b0)
-                $fatal(1, "mesh host write without an accepted instruction must leave done low");
+            if (instruction_done !== 1'b0 || host_read_valid !== 1'b0)
+                $fatal(1, "mesh host write must not complete an instruction or host read");
             host_write_enable = 1'b0;
+        end
+    endtask
+
+    task automatic host_read_word(input integer tx, input integer ty,
+                                  input integer lane, input integer index,
+                                  output logic [127:0] data, output logic [3:0] tag);
+        begin
+            @(negedge clk);
+            host_write_enable = 1'b0;
+            host_read_enable = 1'b1;
+            host_tile_x = tx[7:0]; host_tile_y = ty[7:0];
+            host_memory_select = 1'b0;
+            host_lane = lane[7:0]; host_index = index[3:0];
+            #1;
+            if (host_access_ready !== 1'b1 || instruction_ready !== 1'b0)
+                $fatal(1, "mesh host read request was not accepted while idle");
+            @(posedge clk); #1;
+            if (host_read_valid !== 1'b1)
+                $fatal(1, "accepted mesh host read did not return valid data");
+            data = host_read_data;
+            tag = host_read_type;
+            host_read_enable = 1'b0;
         end
     endtask
 
@@ -57,6 +83,7 @@ module tb_grider_mesh;
                          input integer a, input integer b, input integer c,
                          input logic [127:0] imm, input logic [3:0] tag,
                          input logic [LANES-1:0] mask);
+        integer timeout_cycles;
         begin
             @(negedge clk);
             opcode = op[4:0]; dst = d[3:0]; src_a = a[3:0];
@@ -66,9 +93,20 @@ module tb_grider_mesh;
             if (instruction_ready !== 1'b1)
                 $fatal(1, "mesh instruction was not ready before the accepting edge");
             @(posedge clk); #1;
-            if (instruction_done !== 1'b1)
-                $fatal(1, "accepted mesh instruction did not assert done");
+            if (instruction_done !== 1'b0 || instruction_ready !== 1'b0)
+                $fatal(1, "accepted mesh instruction must enter the busy pipeline");
             instruction_valid = 1'b0;
+            timeout_cycles = 0;
+            while (instruction_done !== 1'b1) begin
+                @(posedge clk); #1;
+                timeout_cycles = timeout_cycles + 1;
+                if (timeout_cycles > 8)
+                    $fatal(1, "mesh instruction pipeline did not retire");
+                if ((instruction_done !== 1'b1) && (instruction_ready !== 1'b0))
+                    $fatal(1, "mesh must stay busy until every tile retires");
+            end
+            if (instruction_ready !== 1'b1)
+                $fatal(1, "mesh must return ready when done is asserted");
         end
     endtask
 
@@ -94,9 +132,13 @@ module tb_grider_mesh;
     reg [127:0] saved_reg15_data [0:TILES_X*TILES_Y-1];
     reg [3:0] saved_reg15_type [0:TILES_X*TILES_Y-1];
     string stim_path;
+    logic [127:0] read_data;
+    logic [3:0] read_type;
+    integer timeout_cycles;
 
     initial begin
         #1;
+        host_read_enable = 1'b0;
         if (instruction_ready !== 1'b0)
             $fatal(1, "mesh instruction_ready must be low during reset");
         repeat (2) @(posedge clk);
@@ -137,16 +179,15 @@ module tb_grider_mesh;
         // blocked mesh instruction has no partial side effects, then restore it.
         for (output_ty = 0; output_ty < TILES_Y; output_ty = output_ty + 1) begin
             for (output_tx = 0; output_tx < TILES_X; output_tx = output_tx + 1) begin
-                host_tile_x = output_tx; host_tile_y = output_ty;
-                host_memory_select = 1'b0; host_lane = 0; host_index = 15;
-                #0.1;
-                saved_reg15_data[output_ty*TILES_X+output_tx] = host_read_data;
-                saved_reg15_type[output_ty*TILES_X+output_tx] = host_read_type;
+                host_read_word(output_tx, output_ty, 0, 15,
+                               saved_reg15_data[output_ty*TILES_X+output_tx],
+                               saved_reg15_type[output_ty*TILES_X+output_tx]);
             end
         end
 
         @(negedge clk);
-        host_write_enable = 1'b1; host_tile_x = 0; host_tile_y = 0;
+        host_write_enable = 1'b1; host_read_enable = 1'b0;
+        host_tile_x = 0; host_tile_y = 0;
         host_memory_select = 1'b0; host_lane = 0; host_index = 15;
         host_write_data = saved_reg15_data[0]; host_write_type = saved_reg15_type[0];
         opcode = 5'd2; dst = 4'd15; src_a = 0; src_b = 0; src_c = 0;
@@ -154,51 +195,41 @@ module tb_grider_mesh;
         lane_mask = '0; lane_mask[0] = 1'b1;
         instruction_valid = 1'b1;
         #0.1;
-        if (instruction_ready !== 1'b0)
-            $fatal(1, "host write must deassert mesh instruction_ready");
+        if (instruction_ready !== 1'b0 || host_access_ready !== 1'b1)
+            $fatal(1, "host write must stall the mesh broadcast");
         @(posedge clk); #0.1;
         if (instruction_done !== 1'b0)
             $fatal(1, "stalled mesh instruction must not assert done");
 
-        // None of the other tiles may execute the broadcast while the mesh is
-        // not ready, even though their individual tile ports are idle.
-        for (output_ty = 0; output_ty < TILES_Y; output_ty = output_ty + 1) begin
-            for (output_tx = 0; output_tx < TILES_X; output_tx = output_tx + 1) begin
-                if ((output_tx != 0) || (output_ty != 0)) begin
-                    host_tile_x = output_tx; host_tile_y = output_ty;
-                    host_lane = 0; host_index = 15; #0.1;
-                    if ((host_read_data !== saved_reg15_data[output_ty*TILES_X+output_tx]) ||
-                        (host_read_type !== saved_reg15_type[output_ty*TILES_X+output_tx]))
-                        $fatal(1, "blocked mesh instruction partially modified tile %0d,%0d",
-                               output_tx, output_ty);
-                end
-            end
-        end
-
+        // Release the blocked request without an instruction handshake, then
+        // inspect every tile to prove that no tile executed the stalled command.
         @(negedge clk);
-        host_tile_x = 0; host_tile_y = 0; host_write_enable = 1'b0;
-        #0.1;
-        if (instruction_ready !== 1'b1)
-            $fatal(1, "mesh instruction_ready must return after host write");
+        host_write_enable = 1'b0;
+        instruction_valid = 1'b0;
         @(posedge clk); #0.1;
-        if (instruction_done !== 1'b1)
-            $fatal(1, "held mesh instruction must complete after acceptance");
+        if (instruction_done !== 1'b0 || instruction_ready !== 1'b1)
+            $fatal(1, "releasing the host write must leave the mesh idle");
 
         for (output_ty = 0; output_ty < TILES_Y; output_ty = output_ty + 1) begin
             for (output_tx = 0; output_tx < TILES_X; output_tx = output_tx + 1) begin
-                host_tile_x = output_tx; host_tile_y = output_ty;
-                host_lane = 0; host_index = 15; #0.1;
-                if ((host_read_data !== 128'h1234) || (host_read_type !== 4'h4))
-                    $fatal(1, "accepted mesh instruction did not update tile %0d,%0d",
+                host_read_word(output_tx, output_ty, 0, 15, read_data, read_type);
+                if ((read_data !== saved_reg15_data[output_ty*TILES_X+output_tx]) ||
+                    (read_type !== saved_reg15_type[output_ty*TILES_X+output_tx]))
+                    $fatal(1, "blocked mesh instruction partially modified tile %0d,%0d",
                            output_tx, output_ty);
             end
         end
 
-        @(negedge clk);
-        instruction_valid = 1'b0;
-        @(posedge clk); #0.1;
-        if (instruction_done !== 1'b0)
-            $fatal(1, "mesh instruction_done must clear when no instruction is accepted");
+        issue(5'd2, 4'd15, 0, 0, 0, 128'h1234, 4'h4,
+              {{(LANES-1){1'b0}}, 1'b1});
+        for (output_ty = 0; output_ty < TILES_Y; output_ty = output_ty + 1) begin
+            for (output_tx = 0; output_tx < TILES_X; output_tx = output_tx + 1) begin
+                host_read_word(output_tx, output_ty, 0, 15, read_data, read_type);
+                if ((read_data !== 128'h1234) || (read_type !== 4'h4))
+                    $fatal(1, "accepted mesh instruction did not update tile %0d,%0d",
+                           output_tx, output_ty);
+            end
+        end
 
         for (output_ty = 0; output_ty < TILES_Y; output_ty = output_ty + 1) begin
             for (output_tx = 0; output_tx < TILES_X; output_tx = output_tx + 1) begin
@@ -210,13 +241,11 @@ module tb_grider_mesh;
 
         for (output_ty = 0; output_ty < TILES_Y; output_ty = output_ty + 1) begin
             for (output_tx = 0; output_tx < TILES_X; output_tx = output_tx + 1) begin
-                host_tile_x = output_tx; host_tile_y = output_ty;
                 for (lane = 0; lane < LANES; lane = lane + 1) begin
-                    host_lane = lane[7:0];
                     for (reg_index = 0; reg_index <= 8; reg_index = reg_index + 1) begin
-                        host_index = reg_index[3:0]; #1;
+                        host_read_word(output_tx, output_ty, lane, reg_index, read_data, read_type);
                         $display("R %0d %0d %0d %0d %032h %01h", output_tx, output_ty,
-                                 lane, reg_index, host_read_data, host_read_type);
+                                 lane, reg_index, read_data, read_type);
                     end
                 end
             end

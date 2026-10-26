@@ -38,6 +38,7 @@ for label, data in (("pre-map", pre), ("mapped", mapped)):
 memories = [cell for cell in all_cells(pre) if cell.get("type", "").startswith("$mem")]
 memory_bits = 0
 memory_shapes = []
+memory_dimensions = []
 for cell in memories:
     params = cell.get("parameters", {})
     width = params.get("WIDTH")
@@ -47,6 +48,12 @@ for cell in memories:
         size = parameter_int(size)
         memory_bits += width * size
         memory_shapes.append(f"{size} words × {width} bit")
+        memory_dimensions.append((size, width))
+
+if sum(1 for size, width in memory_dimensions if size == 16 and width == 132) < 2:
+    raise SystemExit(
+        "Expected separate 16×132 abstract memories for the register file and local SRAM"
+    )
 
 mapped_cells = list(all_cells(mapped))
 mapped_cell_count = len(mapped_cells)
@@ -97,7 +104,7 @@ abstract_memory = (
     f"{len(memories)} cell(s), {memory_bits} bit(s) ({', '.join(memory_shapes)})"
     if memories else "0 cells (RTL arrays were not retained as abstract Yosys memories)"
 )
-report = f"""# Sky130HD synthesis baseline: one PE
+report = f"""# Sky130HD staged-memory estimate: one PE
 
 | Measurement | Result |
 |---|---:|
@@ -116,7 +123,7 @@ report = f"""# Sky130HD synthesis baseline: one PE
 - Area is Yosys stat -liberty after Sky130HD technology mapping. It excludes placement-only cells, clock-tree cells, routing, and physical-design overhead.
 - OpenSTA uses a 100 ns ideal clock, 100 ps clock transition, and zero clock uncertainty. Fmax is derived as 1000 / (100 ns - worst slack).
 - This is a pre-layout, register-to-register estimate. No placed design or extracted SPEF parasitics are supplied, so it is not a routed Fmax.
-- The synthesis run maps to the standard-cell Liberty only; it does not provide an SRAM macro Liberty/LEF or a memory compiler. Abstract Yosys memories are reported before memory mapping, and the gate-level output is checked for RAM/SRAM macro instances.
+- The RTL describes the register file and local SRAM as two 16×132 single-port synchronous memories. The synthesis run maps to the standard-cell Liberty only; it does not provide an SRAM macro Liberty/LEF or a memory compiler. The design therefore reports inferred memories before mapping and standard cells after mapping; the gate-level output is checked for RAM/SRAM macro instances.
 - The exported lane_mask width is checked in both Yosys JSON snapshots to ensure the one-lane parameter override took effect.
 
 ## Tool versions

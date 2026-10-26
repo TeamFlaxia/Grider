@@ -4,9 +4,9 @@
 
 The Grider machine is a two-dimensional mesh of tiles. A tile has 16×16 = 256 cells and one instruction decoder. It decodes once and broadcasts the operation to all active cells; cells do not fetch or decode instructions independently. The RTL mesh defaults to 2×2 tiles and is parameterized for larger rectangular arrays.
 
-Each cell owns sixteen 132-bit architectural registers (128-bit payload plus a 4-bit type tag) and sixteen 132-bit local SRAM words. This is a functional prototype capacity, not an area-optimized memory design. The local SRAM port accesses one selected word per lane per instruction. The host/debug port can initialize state and read it back for bring-up.
+Each cell owns a 16×132-bit register file and a 16×132-bit local SRAM. Each is described as a single-port synchronous memory; payload and type tag share one 132-bit word. A small valid bitmap supplies the architectural reset value, so the memory words themselves do not need reset circuitry. The host/debug port initializes words and reads them back through a one-cycle request/valid handshake.
 
-The lane mask has one bit per cell. Inactive lanes hold both register and SRAM state. A neighbor instruction reads a pre-instruction snapshot; all cells and tiles commit their writes together at the active clock edge. Within-tile routes are combinational. At tile boundaries, edge values are connected through halo buses. At the outer boundary of the mesh, a missing neighbor reads as zero with the source type tag.
+The lane mask has one bit per cell. Inactive lanes hold both register and SRAM state. A neighbor instruction reads a pre-instruction snapshot; all cells and tiles commit their writes together in the writeback stage. Within-tile routes are combinational. At tile boundaries, the selected source values are sent through halo buses after the synchronous register read. At the outer boundary of the mesh, a missing neighbor reads as zero with the source type tag.
 
 Neighbor direction encoding is N, NE, E, SE, S, SW, W, NW (0–7). Tile coordinates are row-major in the software mesh model; cell coordinates are row-major within each tile.
 
@@ -41,10 +41,10 @@ An instruction carries `opcode`, destination/source register indices, a 128-bit 
 
 `grider.sim.Tile.step` models one tile instruction. `grider.sim.Mesh.step` broadcasts one instruction to a rectangular mesh and snapshots values for cross-tile neighbor reads. The RTL equivalent is `grider_tile` plus the `grider_mesh` wrapper. Both expose host/debug state access in hardware; the Python model uses `load_register`, `load_sram`, and read methods.
 
-`python -m grider.verify_rtl` initializes a tile through the host port, issues the same integer and BF16 instruction stream to both models, and compares every register and SRAM payload and tag. `python -m grider.verify_mesh_rtl` compares every register in a 2×2 RTL mesh after testing all eight halo directions. The GitHub Actions workflow runs those checks.
+`python -m grider.verify_rtl` initializes a tile through the host port, issues the same integer and BF16 instruction stream to both models, and compares every register and SRAM payload and tag. `python -m grider.verify_mesh_rtl` compares every register in a 2×2 RTL mesh after testing all eight halo directions. The RTL testbenches also check the host read-valid handshake, busy/ready behavior, delayed completion, and atomic mesh issue. The GitHub Actions workflow runs those checks.
 
 ## AI kernel examples and current scope
 
 `grider.kernels` contains dependency-free host reference implementations for matmul, row softmax, layer norm, scaled dot-product attention, and GELU. `grider.examples` provides runnable demonstrations, including a tiny two-layer MLP. These reference kernels are not yet lowered to Grider instruction programs. The tile ISA has the arithmetic and local communication building blocks; a tiled GEMM mapping, multi-head batching, compiler, instruction fetch, and host runtime remain follow-on work.
 
-The Python model is functional rather than cycle-, area-, or power-accurate. The RTL models a one-instruction-per-cycle tile interface with immediate SRAM reads and synchronous state updates. SRAM banking, timing closure, pipelining, mesh links between physically separate chips, exceptions, and cache coherence are not part of this prototype.
+The Python model is functional rather than cycle-, area-, or power-accurate. The RTL uses synchronous single-port memories and processes one instruction at a time through operand-read, execute, and writeback stages. Multi-source operands are read in separate cycles, so instructions do not overlap and latency depends on the number of reads. This stage structure shortens the memory-to-arithmetic path; it does not yet provide one-instruction-per-cycle throughput. SRAM macro mapping, banking, deeper arithmetic pipelines, mesh links between physically separate chips, exceptions, and cache coherence remain follow-on work.

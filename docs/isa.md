@@ -7,8 +7,10 @@ This document defines the architectural behavior shared by the Python model and 
 - Opcodes 0 through 17 are defined by the instruction table in `architecture.md`. Reserved opcodes 18 through 31 are no-ops.
 - Data type tags 0 through 7 are defined. Tag `0xf` means inherit the source type described below; tags 8 through 14 are reserved.
 - A reserved opcode or reserved type tag completes as a no-op: registers and SRAM remain unchanged. The RTL still pulses `instruction_done` for a valid/ready issue.
-- An instruction is accepted on a rising edge when `rst_n && instruction_valid && instruction_ready`. `instruction_ready` is low during reset or while any tile's host write port is active. A mesh broadcasts an instruction only when every tile is ready, so a stalled issue has no partial side effects. Keep `instruction_valid` asserted until acceptance.
-- `instruction_done` is a registered acknowledgment of the preceding rising edge: it is high after an edge that accepted an instruction and low after an edge that accepted none. Back-to-back accepted instructions can keep it high on consecutive cycles. A host-write stall leaves it low.
+- An instruction is accepted on a rising edge when `rst_n && instruction_valid && instruction_ready`. `instruction_ready` is high only while the tile is idle and no host read or write request is active. It stays low while an accepted instruction is in flight. A mesh broadcasts only when every tile is ready, so a stalled issue has no partial side effects. Keep `instruction_valid` asserted until the accepting edge.
+- The RTL latches the instruction at acceptance, then reads operands, executes, and writes back. The single-port register file serializes source reads: no-read instructions take 2 cycles from acceptance to completion; one-read instructions take 3; two-read instructions take 4; three-read instructions take 5. `MAC` and `SEL` use three reads. `MOVI` with an inherited type uses one read.
+- `instruction_done` is a one-cycle completion pulse after writeback, not an acceptance pulse. It is high after the edge that commits the instruction and low after the following edge unless another instruction retires. With no host request, `instruction_ready` returns high in the cycle of `instruction_done`, so the next instruction may be accepted on the following rising edge.
+- Host writes are accepted on a rising edge when `host_write_enable && host_access_ready`. Host reads use `host_read_enable && host_access_ready`; `host_read_valid` and the data/tag outputs are valid one cycle later. Avoid asserting read and write together; if both are high, the write takes priority.
 - Inactive lanes preserve their register and SRAM state.
 
 ## Payload representation
@@ -42,3 +44,9 @@ For arithmetic and `MOVI`, an explicit tag selects the operation and result type
 - `LOAD` and `STORE` use `imm[3:0]` as the local SRAM address. Higher immediate bits are ignored.
 - `MOVI` uses the immediate's low bits and normalizes them to the selected type.
 
+
+## RTL memory and pipeline
+
+Each cell's register file and local SRAM are single-port synchronous memories. Each memory word packs the 128-bit payload and 4-bit type tag together. Reset clears per-word valid bits; an unwritten word reads as zero with the I32 tag without resetting the memory array itself.
+
+An accepted instruction remains the only in-flight instruction until writeback. Operand reads are serialized to use the one memory port, then the result is captured and written back. This pipeline improves timing separation around memory reads and execution, but it does not overlap instructions; throughput is one instruction per several clock cycles. The Python emulator continues to model the architectural operation functionally and does not model this cycle count.

@@ -1,8 +1,53 @@
+// A one-port synchronous memory. Contents are not reset; a small valid bitmap
+// gives each word the architectural reset value until its first write.
+module grider_sram_1rw #(
+    parameter integer DEPTH = 16,
+    parameter integer ADDR_WIDTH = 4
+) (
+    input  logic                 clk,
+    input  logic                 rst_n,
+    input  logic                 port_enable,
+    input  logic                 port_write,
+    input  logic [ADDR_WIDTH-1:0] port_address,
+    input  logic [131:0]         port_write_data,
+    output logic [131:0]         port_read_data
+);
+    logic [131:0] mem [0:DEPTH-1];
+    logic [DEPTH-1:0] valid;
+    logic [131:0] read_data_q;
+    logic read_valid_q;
+
+    always_ff @(posedge clk) begin
+        if (port_enable && (port_address < DEPTH)) begin
+            if (port_write)
+                mem[port_address] <= port_write_data;
+            else
+                read_data_q <= mem[port_address];
+        end
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            valid <= '0;
+            read_valid_q <= 1'b0;
+        end else if (port_enable && (port_address < DEPTH)) begin
+            if (port_write)
+                valid[port_address] <= 1'b1;
+            else
+                read_valid_q <= valid[port_address];
+        end else if (port_enable && !port_write) begin
+            read_valid_q <= 1'b0;
+        end
+    end
+
+    assign port_read_data = read_valid_q ? read_data_q : {4'h4, 128'b0};
+endmodule
+
 // Grider v0 tile datapath.
-// One decoder issues a single instruction to lockstep cells. Each cell owns
-// typed registers and local SRAM. BF16 arithmetic, integer/bitwise operations,
-// synchronous state updates and same-tile eight-neighbor reads are implemented
-// here; the complete v0 behavior is specified in docs/isa.md.
+// One decoder issues a single in-flight instruction to lockstep cells. Each
+// cell uses synchronous single-port memories; operand reads, execution and
+// writeback are staged. BF16, integer/bitwise and eight-neighbor operations
+// are specified in docs/isa.md.
 module grider_tile #(
     parameter integer TILE_W = 16,
     parameter integer TILE_H = 16,
@@ -16,6 +61,9 @@ module grider_tile #(
     output logic                  instruction_ready,
     output logic                  instruction_done,
     input  logic                  host_write_enable,
+    input  logic                  host_read_enable,
+    output logic                  host_access_ready,
+    output logic                  host_read_valid,
     input  logic                  host_memory_select, // 0: registers, 1: local SRAM
     input  logic [7:0]            host_lane,
     input  logic [3:0]            host_index,
@@ -112,10 +160,112 @@ module grider_tile #(
         end
     endfunction
 
-    logic [127:0] rf_data [0:LANES-1][0:REG_COUNT-1];
-    logic [3:0]   rf_type [0:LANES-1][0:REG_COUNT-1];
-    logic [127:0] sram_data [0:LANES-1][0:SRAM_WORDS-1];
-    logic [3:0]   sram_type [0:LANES-1][0:SRAM_WORDS-1];
+    function automatic logic operation_has_src_a(
+        input logic [4:0] operation,
+        input logic [3:0] type_tag
+    );
+        begin
+            case (operation)
+                OP_MOV, OP_ADD, OP_SUB, OP_MUL, OP_MAC,
+                OP_AND, OP_OR, OP_XOR, OP_SHL, OP_SHR,
+                OP_MIN, OP_MAX, OP_SEL, OP_NEIGHBOR, OP_STORE:
+                    operation_has_src_a = 1'b1;
+                OP_MOVI: operation_has_src_a = (type_tag == DT_INHERIT);
+                default: operation_has_src_a = 1'b0;
+            endcase
+        end
+    endfunction
+
+    function automatic logic operation_has_src_b(input logic [4:0] operation);
+        begin
+            case (operation)
+                OP_ADD, OP_SUB, OP_MUL, OP_MAC,
+                OP_AND, OP_OR, OP_XOR, OP_SHL, OP_SHR,
+                OP_MIN, OP_MAX, OP_SEL:
+                    operation_has_src_b = 1'b1;
+                default: operation_has_src_b = 1'b0;
+            endcase
+        end
+    endfunction
+
+    function automatic logic operation_has_third_read(input logic [4:0] operation);
+        begin
+            operation_has_third_read = (operation == OP_MAC) || (operation == OP_SEL);
+        end
+    endfunction
+
+    function automatic integer same_tile_neighbor(
+        input integer source_lane,
+        input logic [2:0] direction
+    );
+        integer source_x;
+        integer source_y;
+        integer target_x;
+        integer target_y;
+        begin
+            source_x = source_lane % TILE_W;
+            source_y = source_lane / TILE_W;
+            case (direction)
+                3'd0: begin target_x = source_x;     target_y = source_y - 1; end
+                3'd1: begin target_x = source_x + 1; target_y = source_y - 1; end
+                3'd2: begin target_x = source_x + 1; target_y = source_y;     end
+                3'd3: begin target_x = source_x + 1; target_y = source_y + 1; end
+                3'd4: begin target_x = source_x;     target_y = source_y + 1; end
+                3'd5: begin target_x = source_x - 1; target_y = source_y + 1; end
+                3'd6: begin target_x = source_x - 1; target_y = source_y;     end
+                default: begin target_x = source_x - 1; target_y = source_y - 1; end
+            endcase
+            if ((target_x >= 0) && (target_x < TILE_W) &&
+                (target_y >= 0) && (target_y < TILE_H))
+                same_tile_neighbor = target_y * TILE_W + target_x;
+            else
+                same_tile_neighbor = -1;
+        end
+    endfunction
+
+    localparam logic [2:0] ST_IDLE      = 3'd0;
+    localparam logic [2:0] ST_WAIT_A    = 3'd1;
+    localparam logic [2:0] ST_WAIT_B    = 3'd2;
+    localparam logic [2:0] ST_WAIT_C    = 3'd3;
+    localparam logic [2:0] ST_WAIT_LOAD = 3'd4;
+    localparam logic [2:0] ST_EXEC      = 3'd5;
+    localparam logic [2:0] ST_WB        = 3'd6;
+
+    logic [2:0] state;
+    logic [4:0] instruction_opcode_q;
+    logic [3:0] instruction_dst_q;
+    logic [3:0] instruction_src_b_q;
+    logic [3:0] instruction_src_c_q;
+    logic [127:0] instruction_immediate_q;
+    logic [3:0] instruction_dtype_q;
+    logic [LANES-1:0] instruction_lane_mask_q;
+
+    logic [131:0] operand_a [0:LANES-1];
+    logic [131:0] operand_b [0:LANES-1];
+    logic [131:0] operand_c [0:LANES-1];
+    logic [131:0] operand_acc [0:LANES-1];
+    logic [131:0] operand_neighbor [0:LANES-1];
+    logic [131:0] load_operand [0:LANES-1];
+    logic [127:0] writeback_data_q [0:LANES-1];
+    logic [3:0] writeback_type_q [0:LANES-1];
+    logic writeback_write_q [0:LANES-1];
+    logic writeback_store_q [0:LANES-1];
+
+    logic rf_port_enable [0:LANES-1];
+    logic rf_port_write [0:LANES-1];
+    logic [3:0] rf_port_address [0:LANES-1];
+    logic [131:0] rf_port_write_data [0:LANES-1];
+    logic [131:0] rf_port_read_data [0:LANES-1];
+    logic sram_port_enable [0:LANES-1];
+    logic sram_port_write [0:LANES-1];
+    logic [3:0] sram_port_address [0:LANES-1];
+    logic [131:0] sram_port_write_data [0:LANES-1];
+    logic [131:0] sram_port_read_data [0:LANES-1];
+
+    logic [7:0] host_read_lane_q;
+    logic host_read_memory_select_q;
+    logic host_read_address_valid_q;
+    logic host_read_accept;
 
     logic [127:0] lane_result [0:LANES-1];
     logic [3:0]   lane_result_type [0:LANES-1];
@@ -135,26 +285,53 @@ module grider_tile #(
     integer y;
     integer nx;
     integer ny;
-    integer neighbor;
+    integer port_lane;
+    integer i;
 
-    // A host write takes the tile's state port for this cycle.
-    assign instruction_ready = rst_n && !host_write_enable;
+
+    // A host transaction uses a memory port only while the instruction engine is idle.
+    assign host_access_ready = rst_n && (state == ST_IDLE);
+    // Acceptance is separate from completion: ready returns only after writeback.
+    assign instruction_ready = rst_n && (state == ST_IDLE) &&
+                               !host_write_enable && !host_read_enable;
+    // The host response is valid for the cycle after this request is accepted.
+    assign host_read_accept = host_read_enable && !host_write_enable && host_access_ready;
 
     always_comb begin
         host_read_data = '0;
         host_read_type = DT_I32;
-        if (host_lane < LANES) begin
-            if (host_memory_select) begin
-                if (host_index < SRAM_WORDS) begin
-                    host_read_data = sram_data[host_lane][host_index];
-                    host_read_type = sram_type[host_lane][host_index];
-                end
-            end else if (host_index < REG_COUNT) begin
-                host_read_data = rf_data[host_lane][host_index];
-                host_read_type = rf_type[host_lane][host_index];
+        if (host_read_address_valid_q && (host_read_lane_q < LANES)) begin
+            if (host_read_memory_select_q) begin
+                host_read_data = sram_port_read_data[host_read_lane_q][127:0];
+                host_read_type = sram_port_read_data[host_read_lane_q][131:128];
+            end else begin
+                host_read_data = rf_port_read_data[host_read_lane_q][127:0];
+                host_read_type = rf_port_read_data[host_read_lane_q][131:128];
             end
         end
     end
+
+    genvar memory_lane;
+    generate
+        for (memory_lane = 0; memory_lane < LANES; memory_lane = memory_lane + 1) begin : lane_memories
+            grider_sram_1rw #(.DEPTH(REG_COUNT), .ADDR_WIDTH(4)) register_file (
+                .clk(clk), .rst_n(rst_n),
+                .port_enable(rf_port_enable[memory_lane]),
+                .port_write(rf_port_write[memory_lane]),
+                .port_address(rf_port_address[memory_lane]),
+                .port_write_data(rf_port_write_data[memory_lane]),
+                .port_read_data(rf_port_read_data[memory_lane])
+            );
+            grider_sram_1rw #(.DEPTH(SRAM_WORDS), .ADDR_WIDTH(4)) local_sram (
+                .clk(clk), .rst_n(rst_n),
+                .port_enable(sram_port_enable[memory_lane]),
+                .port_write(sram_port_write[memory_lane]),
+                .port_address(sram_port_address[memory_lane]),
+                .port_write_data(sram_port_write_data[memory_lane]),
+                .port_read_data(sram_port_read_data[memory_lane])
+            );
+        end
+    endgenerate
 
     integer edge_x;
     integer edge_y;
@@ -168,17 +345,17 @@ module grider_tile #(
         edge_south_west = '0;
         edge_north_west = '0;
         for (edge_x = 0; edge_x < TILE_W; edge_x = edge_x + 1) begin
-            edge_north[edge_x*132 +: 132] = {rf_type[edge_x][src_a], rf_data[edge_x][src_a]};
-            edge_south[edge_x*132 +: 132] = {rf_type[(TILE_H-1)*TILE_W+edge_x][src_a], rf_data[(TILE_H-1)*TILE_W+edge_x][src_a]};
+            edge_north[edge_x*132 +: 132] = operand_a[edge_x];
+            edge_south[edge_x*132 +: 132] = operand_a[(TILE_H-1)*TILE_W+edge_x];
         end
         for (edge_y = 0; edge_y < TILE_H; edge_y = edge_y + 1) begin
-            edge_west[edge_y*132 +: 132] = {rf_type[edge_y*TILE_W][src_a], rf_data[edge_y*TILE_W][src_a]};
-            edge_east[edge_y*132 +: 132] = {rf_type[edge_y*TILE_W+TILE_W-1][src_a], rf_data[edge_y*TILE_W+TILE_W-1][src_a]};
+            edge_west[edge_y*132 +: 132] = operand_a[edge_y*TILE_W];
+            edge_east[edge_y*132 +: 132] = operand_a[edge_y*TILE_W+TILE_W-1];
         end
-        edge_north_west = {rf_type[0][src_a], rf_data[0][src_a]};
-        edge_north_east = {rf_type[TILE_W-1][src_a], rf_data[TILE_W-1][src_a]};
-        edge_south_west = {rf_type[(TILE_H-1)*TILE_W][src_a], rf_data[(TILE_H-1)*TILE_W][src_a]};
-        edge_south_east = {rf_type[LANES-1][src_a], rf_data[LANES-1][src_a]};
+        edge_north_west = operand_a[0];
+        edge_north_east = operand_a[TILE_W-1];
+        edge_south_west = operand_a[(TILE_H-1)*TILE_W];
+        edge_south_east = operand_a[LANES-1];
     end
 
     function automatic logic [127:0] sign_extend_by_type(
@@ -430,49 +607,138 @@ module grider_tile #(
     endfunction
 
     always_comb begin
+        for (port_lane = 0; port_lane < LANES; port_lane = port_lane + 1) begin
+            rf_port_enable[port_lane] = 1'b0;
+            rf_port_write[port_lane] = 1'b0;
+            rf_port_address[port_lane] = '0;
+            rf_port_write_data[port_lane] = '0;
+            sram_port_enable[port_lane] = 1'b0;
+            sram_port_write[port_lane] = 1'b0;
+            sram_port_address[port_lane] = '0;
+            sram_port_write_data[port_lane] = '0;
+        end
+
+        if (rst_n) begin
+            if (state == ST_IDLE) begin
+                if (host_write_enable || host_read_enable) begin
+                    for (port_lane = 0; port_lane < LANES; port_lane = port_lane + 1) begin
+                        if ((host_lane < LANES) && (host_lane == port_lane)) begin
+                            if (host_memory_select) begin
+                                if (host_index < SRAM_WORDS) begin
+                                    if (host_write_enable && dtype_is_valid(host_write_type)) begin
+                                        sram_port_enable[port_lane] = 1'b1;
+                                        sram_port_write[port_lane] = 1'b1;
+                                        sram_port_address[port_lane] = host_index;
+                                        sram_port_write_data[port_lane] =
+                                            {host_write_type, truncate_by_type(host_write_data, host_write_type)};
+                                    end else if (host_read_enable && !host_write_enable) begin
+                                        sram_port_enable[port_lane] = 1'b1;
+                                        sram_port_address[port_lane] = host_index;
+                                    end
+                                end
+                            end else if (host_index < REG_COUNT) begin
+                                if (host_write_enable && dtype_is_valid(host_write_type)) begin
+                                    rf_port_enable[port_lane] = 1'b1;
+                                    rf_port_write[port_lane] = 1'b1;
+                                    rf_port_address[port_lane] = host_index;
+                                    rf_port_write_data[port_lane] =
+                                        {host_write_type, truncate_by_type(host_write_data, host_write_type)};
+                                end else if (host_read_enable && !host_write_enable) begin
+                                    rf_port_enable[port_lane] = 1'b1;
+                                    rf_port_address[port_lane] = host_index;
+                                end
+                            end
+                        end
+                    end
+                end else if (instruction_valid && instruction_ready) begin
+                    if (opcode == OP_LOAD) begin
+                        for (port_lane = 0; port_lane < LANES; port_lane = port_lane + 1) begin
+                            sram_port_enable[port_lane] = 1'b1;
+                            sram_port_address[port_lane] = immediate[3:0];
+                        end
+                    end else if (operation_has_src_a(opcode, dtype)) begin
+                        for (port_lane = 0; port_lane < LANES; port_lane = port_lane + 1) begin
+                            rf_port_enable[port_lane] = 1'b1;
+                            rf_port_address[port_lane] = src_a;
+                        end
+                    end
+                end
+            end else if (state == ST_WAIT_A && operation_has_src_b(instruction_opcode_q)) begin
+                for (port_lane = 0; port_lane < LANES; port_lane = port_lane + 1) begin
+                    rf_port_enable[port_lane] = 1'b1;
+                    rf_port_address[port_lane] = instruction_src_b_q;
+                end
+            end else if (state == ST_WAIT_B && operation_has_third_read(instruction_opcode_q)) begin
+                for (port_lane = 0; port_lane < LANES; port_lane = port_lane + 1) begin
+                    rf_port_enable[port_lane] = 1'b1;
+                    rf_port_address[port_lane] =
+                        (instruction_opcode_q == OP_MAC) ? instruction_dst_q : instruction_src_c_q;
+                end
+            end else if (state == ST_WB) begin
+                for (port_lane = 0; port_lane < LANES; port_lane = port_lane + 1) begin
+                    if (instruction_lane_mask_q[port_lane]) begin
+                        if (writeback_store_q[port_lane]) begin
+                            sram_port_enable[port_lane] = 1'b1;
+                            sram_port_write[port_lane] = 1'b1;
+                            sram_port_address[port_lane] = instruction_immediate_q[3:0];
+                            sram_port_write_data[port_lane] =
+                                {writeback_type_q[port_lane], writeback_data_q[port_lane]};
+                        end else if (writeback_write_q[port_lane]) begin
+                            rf_port_enable[port_lane] = 1'b1;
+                            rf_port_write[port_lane] = 1'b1;
+                            rf_port_address[port_lane] = instruction_dst_q;
+                            rf_port_write_data[port_lane] =
+                                {writeback_type_q[port_lane], writeback_data_q[port_lane]};
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    always_comb begin
         for (lane = 0; lane < LANES; lane = lane + 1) begin
             lane_result[lane] = '0;
-            lane_result_type[lane] = dtype;
+            lane_result_type[lane] = instruction_dtype_q;
             lane_write[lane] = 1'b0;
             lane_store[lane] = 1'b0;
-            lane_a[lane] = rf_data[lane][src_a];
-            lane_b[lane] = rf_data[lane][src_b];
-            lane_c[lane] = rf_data[lane][src_c];
-            lane_acc[lane] = rf_data[lane][dst];
+            lane_a[lane] = operand_a[lane][127:0];
+            lane_b[lane] = operand_b[lane][127:0];
+            lane_c[lane] = operand_c[lane][127:0];
+            lane_acc[lane] = operand_acc[lane][127:0];
             signed_a = '0;
             signed_b = '0;
             signed_min_a = '0;
             signed_min_b = '0;
-            if (opcode == OP_SEL) begin
-                lane_dtype[lane] = (dtype == DT_INHERIT) ? rf_type[lane][src_b] : dtype;
-            end else if (opcode == OP_LOAD) begin
-                lane_dtype[lane] = sram_type[lane][immediate[3:0]];
-            end else if ((opcode == OP_MOV) || (opcode == OP_NEIGHBOR) || (opcode == OP_STORE)) begin
-                lane_dtype[lane] = rf_type[lane][src_a];
-            end else if (dtype == DT_INHERIT) begin
-                lane_dtype[lane] = rf_type[lane][src_a];
+            if (instruction_opcode_q == OP_SEL) begin
+                lane_dtype[lane] = (instruction_dtype_q == DT_INHERIT) ? operand_b[lane][131:128] : instruction_dtype_q;
+            end else if (instruction_opcode_q == OP_LOAD) begin
+                lane_dtype[lane] = load_operand[lane][131:128];
+            end else if ((instruction_opcode_q == OP_MOV) || (instruction_opcode_q == OP_NEIGHBOR) || (instruction_opcode_q == OP_STORE)) begin
+                lane_dtype[lane] = operand_a[lane][131:128];
+            end else if (instruction_dtype_q == DT_INHERIT) begin
+                lane_dtype[lane] = operand_a[lane][131:128];
             end else begin
-                lane_dtype[lane] = dtype;
+                lane_dtype[lane] = instruction_dtype_q;
             end
-            neighbor = -1;
             x = 0;
             y = 0;
             nx = 0;
             ny = 0;
 
-            if (instruction_valid && lane_mask[lane] &&
-                ((dtype == DT_INHERIT) || dtype_is_valid(dtype)) &&
+            if (state == ST_EXEC && instruction_lane_mask_q[lane] &&
+                ((instruction_dtype_q == DT_INHERIT) || dtype_is_valid(instruction_dtype_q)) &&
                 dtype_is_valid(lane_dtype[lane]) &&
-                opcode_supports_dtype(opcode, lane_dtype[lane])) begin
-                case (opcode)
+                opcode_supports_dtype(instruction_opcode_q, lane_dtype[lane])) begin
+                case (instruction_opcode_q)
                     OP_NOP: begin end
                     OP_MOV: begin
-                        lane_result[lane] = truncate_by_type(lane_a[lane], rf_type[lane][src_a]);
-                        lane_result_type[lane] = rf_type[lane][src_a];
+                        lane_result[lane] = truncate_by_type(lane_a[lane], operand_a[lane][131:128]);
+                        lane_result_type[lane] = operand_a[lane][131:128];
                         lane_write[lane] = 1'b1;
                     end
                     OP_MOVI: begin
-                        lane_result[lane] = truncate_by_type(immediate, lane_dtype[lane]);
+                        lane_result[lane] = truncate_by_type(instruction_immediate_q, lane_dtype[lane]);
                         lane_result_type[lane] = lane_dtype[lane];
                         lane_write[lane] = 1'b1;
                     end
@@ -484,10 +750,10 @@ module grider_tile #(
                         signed_min_a = $signed(sign_extend_by_type(lane_a[lane], lane_dtype[lane]));
                         signed_min_b = $signed(sign_extend_by_type(lane_b[lane], lane_dtype[lane]));
                         if ((lane_dtype[lane] == DT_BF16) &&
-                            ((opcode == OP_ADD) || (opcode == OP_SUB) ||
-                             (opcode == OP_MUL) || (opcode == OP_MAC) ||
-                             (opcode == OP_MIN) || (opcode == OP_MAX))) begin
-                            case (opcode)
+                            ((instruction_opcode_q == OP_ADD) || (instruction_opcode_q == OP_SUB) ||
+                             (instruction_opcode_q == OP_MUL) || (instruction_opcode_q == OP_MAC) ||
+                             (instruction_opcode_q == OP_MIN) || (instruction_opcode_q == OP_MAX))) begin
+                            case (instruction_opcode_q)
                                 OP_ADD: lane_result[lane] = {112'b0, bf16_add(lane_a[lane][15:0], lane_b[lane][15:0])};
                                 OP_SUB: lane_result[lane] = {112'b0, bf16_add(lane_a[lane][15:0], {~lane_b[lane][15], lane_b[lane][14:0]})};
                                 OP_MUL: lane_result[lane] = {112'b0, bf16_mul(lane_a[lane][15:0], lane_b[lane][15:0])};
@@ -509,7 +775,7 @@ module grider_tile #(
                                 default: lane_result[lane] = '0;
                             endcase
                         end else begin
-                            case (opcode)
+                            case (instruction_opcode_q)
                                 OP_ADD: lane_result[lane] = signed_a + signed_b;
                                 OP_SUB: lane_result[lane] = signed_a - signed_b;
                                 OP_MUL: lane_result[lane] = signed_a * signed_b;
@@ -539,8 +805,8 @@ module grider_tile #(
                     OP_NEIGHBOR: begin
                         x = lane % TILE_W;
                         y = lane / TILE_W;
-                        // Direction immediate[2:0]: N, NE, E, SE, S, SW, W, NW.
-                        case (immediate[2:0])
+                        // Direction instruction_immediate_q[2:0]: N, NE, E, SE, S, SW, W, NW.
+                        case (instruction_immediate_q[2:0])
                             3'd0: begin nx = x;     ny = y - 1; end
                             3'd1: begin nx = x + 1; ny = y - 1; end
                             3'd2: begin nx = x + 1; ny = y;     end
@@ -551,33 +817,32 @@ module grider_tile #(
                             default: begin nx = x - 1; ny = y - 1; end
                         endcase
                         if ((nx >= 0) && (nx < TILE_W) && (ny >= 0) && (ny < TILE_H)) begin
-                            neighbor = ny * TILE_W + nx;
-                            lane_result[lane] = rf_data[neighbor][src_a];
-                            lane_result_type[lane] = rf_type[neighbor][src_a];
+                            lane_result[lane] = operand_neighbor[lane][127:0];
+                            lane_result_type[lane] = operand_neighbor[lane][131:128];
                         end else if ((nx < 0) && (ny < 0)) begin
                             lane_result[lane] = halo_north_west_valid ? halo_north_west[127:0] : '0;
-                            lane_result_type[lane] = halo_north_west_valid ? halo_north_west[131:128] : rf_type[lane][src_a];
+                            lane_result_type[lane] = halo_north_west_valid ? halo_north_west[131:128] : operand_a[lane][131:128];
                         end else if ((nx >= TILE_W) && (ny < 0)) begin
                             lane_result[lane] = halo_north_east_valid ? halo_north_east[127:0] : '0;
-                            lane_result_type[lane] = halo_north_east_valid ? halo_north_east[131:128] : rf_type[lane][src_a];
+                            lane_result_type[lane] = halo_north_east_valid ? halo_north_east[131:128] : operand_a[lane][131:128];
                         end else if ((nx < 0) && (ny >= TILE_H)) begin
                             lane_result[lane] = halo_south_west_valid ? halo_south_west[127:0] : '0;
-                            lane_result_type[lane] = halo_south_west_valid ? halo_south_west[131:128] : rf_type[lane][src_a];
+                            lane_result_type[lane] = halo_south_west_valid ? halo_south_west[131:128] : operand_a[lane][131:128];
                         end else if ((nx >= TILE_W) && (ny >= TILE_H)) begin
                             lane_result[lane] = halo_south_east_valid ? halo_south_east[127:0] : '0;
-                            lane_result_type[lane] = halo_south_east_valid ? halo_south_east[131:128] : rf_type[lane][src_a];
+                            lane_result_type[lane] = halo_south_east_valid ? halo_south_east[131:128] : operand_a[lane][131:128];
                         end else if (nx < 0) begin
                             lane_result[lane] = halo_west_valid[ny] ? halo_west[ny*132 +: 128] : '0;
-                            lane_result_type[lane] = halo_west_valid[ny] ? halo_west[ny*132+128 +: 4] : rf_type[lane][src_a];
+                            lane_result_type[lane] = halo_west_valid[ny] ? halo_west[ny*132+128 +: 4] : operand_a[lane][131:128];
                         end else if (nx >= TILE_W) begin
                             lane_result[lane] = halo_east_valid[ny] ? halo_east[ny*132 +: 128] : '0;
-                            lane_result_type[lane] = halo_east_valid[ny] ? halo_east[ny*132+128 +: 4] : rf_type[lane][src_a];
+                            lane_result_type[lane] = halo_east_valid[ny] ? halo_east[ny*132+128 +: 4] : operand_a[lane][131:128];
                         end else if (ny < 0) begin
                             lane_result[lane] = halo_north_valid[nx] ? halo_north[nx*132 +: 128] : '0;
-                            lane_result_type[lane] = halo_north_valid[nx] ? halo_north[nx*132+128 +: 4] : rf_type[lane][src_a];
+                            lane_result_type[lane] = halo_north_valid[nx] ? halo_north[nx*132+128 +: 4] : operand_a[lane][131:128];
                         end else if (ny >= TILE_H) begin
                             lane_result[lane] = halo_south_valid[nx] ? halo_south[nx*132 +: 128] : '0;
-                            lane_result_type[lane] = halo_south_valid[nx] ? halo_south[nx*132+128 +: 4] : rf_type[lane][src_a];
+                            lane_result_type[lane] = halo_south_valid[nx] ? halo_south[nx*132+128 +: 4] : operand_a[lane][131:128];
                         end else begin
                             lane_result[lane] = '0;
                             lane_result_type[lane] = lane_dtype[lane];
@@ -585,14 +850,14 @@ module grider_tile #(
                         lane_write[lane] = 1'b1;
                     end
                     OP_LOAD: begin
-                        lane_result[lane] = sram_data[lane][immediate[3:0]];
-                        lane_result_type[lane] = sram_type[lane][immediate[3:0]];
+                        lane_result[lane] = load_operand[lane][127:0];
+                        lane_result_type[lane] = load_operand[lane][131:128];
                         lane_write[lane] = 1'b1;
                     end
                     OP_STORE: begin
                         lane_store[lane] = 1'b1;
                         lane_result[lane] = lane_a[lane];
-                        lane_result_type[lane] = rf_type[lane][src_a];
+                        lane_result_type[lane] = operand_a[lane][131:128];
                     end
                     default: begin end
                 endcase
@@ -600,50 +865,110 @@ module grider_tile #(
         end
     end
 
-    integer i;
-    integer r;
-    integer w;
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
+            state <= ST_IDLE;
             instruction_done <= 1'b0;
+            host_read_valid <= 1'b0;
+            host_read_lane_q <= '0;
+            host_read_memory_select_q <= 1'b0;
+            host_read_address_valid_q <= 1'b0;
+            instruction_opcode_q <= OP_NOP;
+            instruction_dst_q <= '0;
+            instruction_src_b_q <= '0;
+            instruction_src_c_q <= '0;
+            instruction_immediate_q <= '0;
+            instruction_dtype_q <= DT_I32;
+            instruction_lane_mask_q <= '0;
             for (i = 0; i < LANES; i = i + 1) begin
-                for (r = 0; r < REG_COUNT; r = r + 1) begin
-                    rf_data[i][r] <= '0;
-                    rf_type[i][r] <= DT_I32;
-                end
-                for (w = 0; w < SRAM_WORDS; w = w + 1) begin
-                    sram_data[i][w] <= '0;
-                    sram_type[i][w] <= DT_I32;
-                end
+                operand_a[i] <= {DT_I32, 128'b0};
+                operand_b[i] <= {DT_I32, 128'b0};
+                operand_c[i] <= {DT_I32, 128'b0};
+                operand_acc[i] <= {DT_I32, 128'b0};
+                operand_neighbor[i] <= {DT_I32, 128'b0};
+                load_operand[i] <= {DT_I32, 128'b0};
+                writeback_data_q[i] <= '0;
+                writeback_type_q[i] <= DT_I32;
+                writeback_write_q[i] <= 1'b0;
+                writeback_store_q[i] <= 1'b0;
             end
         end else begin
-            instruction_done <= 1'b0;
-            if (host_write_enable) begin
-                if ((host_lane < LANES) && dtype_is_valid(host_write_type)) begin
-                    if (host_memory_select && (host_index < SRAM_WORDS)) begin
-                        sram_data[host_lane][host_index] <= truncate_by_type(host_write_data, host_write_type);
-                        sram_type[host_lane][host_index] <= host_write_type;
-                    end else if (!host_memory_select && (host_index < REG_COUNT)) begin
-                        rf_data[host_lane][host_index] <= truncate_by_type(host_write_data, host_write_type);
-                        rf_type[host_lane][host_index] <= host_write_type;
-                    end
-                end
-            end else if (instruction_valid) begin
-                instruction_done <= 1'b1;
-                for (i = 0; i < LANES; i = i + 1) begin
-                    if (lane_mask[i]) begin
-                        if (lane_write[i] && (opcode != OP_STORE)) begin
-                            rf_data[i][dst] <= lane_result[i];
-                            rf_type[i][dst] <= lane_result_type[i];
-                        end
-                        if (lane_store[i]) begin
-                            sram_data[i][immediate[3:0]] <= lane_result[i];
-                            sram_type[i][immediate[3:0]] <= lane_result_type[i];
-                        end
-                    end
-                end
+            instruction_done <= (state == ST_WB);
+            host_read_valid <= host_read_accept;
+            if (host_read_accept) begin
+                host_read_lane_q <= host_lane;
+                host_read_memory_select_q <= host_memory_select;
+                host_read_address_valid_q <= (host_lane < LANES) &&
+                    (host_memory_select ? (host_index < SRAM_WORDS) : (host_index < REG_COUNT));
             end
+
+            case (state)
+                ST_IDLE: begin
+                    if (instruction_valid && instruction_ready) begin
+                        instruction_opcode_q <= opcode;
+                        instruction_dst_q <= dst;
+                        instruction_src_b_q <= src_b;
+                        instruction_src_c_q <= src_c;
+                        instruction_immediate_q <= immediate;
+                        instruction_dtype_q <= dtype;
+                        instruction_lane_mask_q <= lane_mask;
+                        if (opcode == OP_LOAD)
+                            state <= ST_WAIT_LOAD;
+                        else if (operation_has_src_a(opcode, dtype))
+                            state <= ST_WAIT_A;
+                        else
+                            state <= ST_EXEC;
+                    end
+                end
+                ST_WAIT_LOAD: begin
+                    for (i = 0; i < LANES; i = i + 1)
+                        load_operand[i] <= sram_port_read_data[i];
+                    state <= ST_EXEC;
+                end
+                ST_WAIT_A: begin
+                    for (i = 0; i < LANES; i = i + 1) begin
+                        operand_a[i] <= rf_port_read_data[i];
+                        operand_neighbor[i] <= rf_port_read_data[i];
+                        if (instruction_opcode_q == OP_NEIGHBOR) begin
+                            if (same_tile_neighbor(i, instruction_immediate_q[2:0]) >= 0)
+                                operand_neighbor[i] <=
+                                    rf_port_read_data[same_tile_neighbor(i, instruction_immediate_q[2:0])];
+                        end
+                    end
+                    if (operation_has_src_b(instruction_opcode_q))
+                        state <= ST_WAIT_B;
+                    else
+                        state <= ST_EXEC;
+                end
+                ST_WAIT_B: begin
+                    for (i = 0; i < LANES; i = i + 1)
+                        operand_b[i] <= rf_port_read_data[i];
+                    if (operation_has_third_read(instruction_opcode_q))
+                        state <= ST_WAIT_C;
+                    else
+                        state <= ST_EXEC;
+                end
+                ST_WAIT_C: begin
+                    for (i = 0; i < LANES; i = i + 1) begin
+                        if (instruction_opcode_q == OP_MAC)
+                            operand_acc[i] <= rf_port_read_data[i];
+                        else
+                            operand_c[i] <= rf_port_read_data[i];
+                    end
+                    state <= ST_EXEC;
+                end
+                ST_EXEC: begin
+                    for (i = 0; i < LANES; i = i + 1) begin
+                        writeback_data_q[i] <= lane_result[i];
+                        writeback_type_q[i] <= lane_result_type[i];
+                        writeback_write_q[i] <= lane_write[i];
+                        writeback_store_q[i] <= lane_store[i];
+                    end
+                    state <= ST_WB;
+                end
+                ST_WB: state <= ST_IDLE;
+                default: state <= ST_IDLE;
+            endcase
         end
     end
-
 endmodule
