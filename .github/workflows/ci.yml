@@ -1,0 +1,24 @@
+name: Grider checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python-and-rtl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Icarus Verilog
+        run: sudo apt-get update && sudo apt-get install -y iverilog
+      - name: Run Python unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Compare emulator and RTL
+        run: python -m grider.verify_rtl
+      - name: Compare mesh halos
+        run: python -m grider.verify_mesh_rtl
+      - name: Run examples
+        run: make examples

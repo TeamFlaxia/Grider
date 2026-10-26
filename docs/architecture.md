@@ -1,52 +1,50 @@
-# Grider architecture sketch
+# Grider architecture
 
-## Processing organization
+## Organization
 
-The first design point is a two-dimensional array of 16×16-cell tiles. A tile issues one instruction to all 256 cells per cycle. Control/decode is centralized at the tile boundary; cells contain datapath and state, but no independent instruction decoder. A lane mask selects cells for predicated work.
+The Grider machine is a two-dimensional mesh of tiles. A tile has 16×16 = 256 cells and one instruction decoder. It decodes once and broadcasts the operation to all active cells; cells do not fetch or decode instructions independently. The RTL mesh defaults to 2×2 tiles and is parameterized for larger rectangular arrays.
 
-Each cell has sixteen 132-bit architectural registers: a 128-bit payload and a 4-bit type tag. It also owns sixteen 132-bit local SRAM words. This initial capacity is a tunable modeling choice, not a final area claim. Local loads and stores only access that cell's SRAM, avoiding a bank arbiter in the base model.
+Each cell owns sixteen 132-bit architectural registers (128-bit payload plus a 4-bit type tag) and sixteen 132-bit local SRAM words. This is a functional prototype capacity, not an area-optimized memory design. The local SRAM port accesses one selected word per lane per instruction. The host/debug port can initialize state and read it back for bring-up.
 
-Neighborhood reads use the eight adjacent cells in the same tile. The encoding is N, NE, E, SE, S, SW, W, NW. An edge read returns zero; this avoids hidden wraparound dependencies. The Python instruction is atomic across lanes, so a neighbor read sees the state from before that instruction.
+The lane mask has one bit per cell. Inactive lanes hold both register and SRAM state. A neighbor instruction reads a pre-instruction snapshot; all cells and tiles commit their writes together at the active clock edge. Within-tile routes are combinational. At tile boundaries, edge values are connected through halo buses. At the outer boundary of the mesh, a missing neighbor reads as zero with the source type tag.
+
+Neighbor direction encoding is N, NE, E, SE, S, SW, W, NW (0–7). Tile coordinates are row-major in the software mesh model; cell coordinates are row-major within each tile.
 
 ## Data formats
 
-| Tag | Format | Notes |
+| Tag | Format | Arithmetic behavior |
 | --- | --- | --- |
-| `I4` | signed 4-bit integer | arithmetic wraps to 4 bits |
-| `I8` | signed 8-bit integer | arithmetic wraps to 8 bits |
-| `BF16` | bfloat16 | Python add/multiply use float32 conversion and round-to-nearest-even on writeback |
-| `I16`, `I32`, `I64` | signed integer | general scalar operations |
-| `U128` | unsigned 128-bit bit vector | logical operations and payload movement |
-| `PRED` | predicate | predicate-friendly tag; prototype `SEL` currently selects on zero/nonzero payload |
+| `I4` | signed 4-bit integer | wraps modulo 16; interpreted as signed on reads |
+| `I8` | signed 8-bit integer | wraps modulo 256; interpreted as signed on reads |
+| `BF16` | bfloat16 | add, subtract, multiply, MAC, min and max; round-to-nearest, ties-to-even |
+| `I16`, `I32`, `I64` | signed integers | wrap to the selected width |
+| `U128` | unsigned 128-bit vector | bit operations and payload movement |
+| `PRED` | predicate | nonzero means true |
 
-The tag travels with each register value. Arithmetic uses the instruction's explicit `dtype` when supplied and otherwise the first source's tag. A production ISA should probably make format selection explicit in the instruction encoding.
+BF16 MAC rounds the product to BF16 and then rounds the accumulated sum to BF16. The standalone `gemm16` reference instead accumulates in host float and rounds once at the output; use the instruction emulator when matching hardware BF16 accumulation behavior.
 
-## Initial instruction sketch
+## Instruction sketch
 
 | Operation | Behavior |
 | --- | --- |
-| `MOV`, `MOVI` | move a register value or sign/zero-truncated immediate |
-| `ADD`, `SUB`, `MUL`, `MAC` | lane-wise arithmetic; `MAC` adds `src_a × src_b` to old `dst` |
-| `AND`, `OR`, `XOR`, `SHL`, `SHR` | general bit operations |
-| `MIN`, `MAX`, `SEL` | lane-wise compare; `SEL` uses `src_a` as predicate, `src_b` for true and `src_c` for false |
-| `NEIGHBOR` | copy `src_a` from one of the eight neighboring cells |
-| `LOAD`, `STORE` | access one word of the issuing cell's local SRAM |
+| `MOV`, `MOVI` | copy a typed value or load an immediate |
+| `ADD`, `SUB`, `MUL`, `MAC` | lane-wise numeric arithmetic; MAC adds product to old `dst` |
+| `AND`, `OR`, `XOR`, `SHL`, `SHR` | payload bit operations |
+| `MIN`, `MAX` | signed integer or BF16 comparison |
+| `SEL` | `dst = src_a != 0 ? src_b : src_c` |
+| `NEIGHBOR` | copy one of eight adjacent cell values |
+| `LOAD`, `STORE` | read/write one word of each active cell's local SRAM |
 
-The functional `gemm16` reference maps one 16×16 matrix result onto the 256 cells. In hardware this is a schedule, not a monolithic GEMM opcode: stage matrix fragments into cells and issue repeated MAC/data-movement operations. A mapping/compiler layer remains future work.
+An instruction carries `opcode`, destination/source register indices, a 128-bit immediate, a type selector, and a 256-bit lane mask. The type selector `0xf` means inherit the first source's type (or `src_b` for `SEL`). `LOAD`/`STORE` use `imm[3:0]` as the local SRAM word index; `NEIGHBOR` uses `imm[2:0]` as its direction.
 
-## Cycle and memory assumptions
+## Python and RTL contract
 
-- One instruction is accepted and completed per cycle in the RTL tile interface.
-- Every enabled lane updates on the same rising edge; disabled lanes hold their state.
-- Local SRAM is modeled as a synchronous write/read state array. The first RTL scaffold uses a single selected word for an issued load/store.
-- Cross-tile routing, global synchronization, host command transport, and cache/coherence are out of scope.
-- The Python model is functional, not cycle/area/power accurate.
+`grider.sim.Tile.step` models one tile instruction. `grider.sim.Mesh.step` broadcasts one instruction to a rectangular mesh and snapshots values for cross-tile neighbor reads. The RTL equivalent is `grider_tile` plus the `grider_mesh` wrapper. Both expose host/debug state access in hardware; the Python model uses `load_register`, `load_sram`, and read methods.
 
-## Open design questions
+`python -m grider.verify_rtl` initializes a tile through the host port, issues the same integer and BF16 instruction stream to both models, and compares every register and SRAM payload and tag. `python -m grider.verify_mesh_rtl` compares every register in a 2×2 RTL mesh after testing all eight halo directions. The GitHub Actions workflow runs those checks.
 
-1. Should a cell own a complete 16-word register file, or should registers be distributed across cells as vector planes?
-2. How should tile edges communicate: boundary ports, halo SRAM, or explicit mesh routers?
-3. Are lane masks static predicates, generated by vector compare, or both?
-4. Should local SRAM support one, two, or more ports, and should adjacent-cell reads have independent bandwidth?
-5. What accumulation width and saturation/rounding modes are needed for INT4/INT8/BF16 GEMM?
-6. What instruction encoding and host programming interface should be frozen first?
+## AI kernel examples and current scope
+
+`grider.kernels` contains dependency-free host reference implementations for matmul, row softmax, layer norm, scaled dot-product attention, and GELU. `grider.examples` provides runnable demonstrations, including a tiny two-layer MLP. These reference kernels are not yet lowered to Grider instruction programs. The tile ISA has the arithmetic and local communication building blocks; a tiled GEMM mapping, multi-head batching, compiler, instruction fetch, and host runtime remain follow-on work.
+
+The Python model is functional rather than cycle-, area-, or power-accurate. The RTL models a one-instruction-per-cycle tile interface with immediate SRAM reads and synchronous state updates. SRAM banking, timing closure, pipelining, mesh links between physically separate chips, exceptions, and cache coherence are not part of this prototype.

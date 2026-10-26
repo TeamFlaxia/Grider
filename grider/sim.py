@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+import math
 import struct
 from typing import Iterable, Sequence
 
@@ -96,10 +97,13 @@ def _pack(value: int, dtype: DataType) -> int:
 
 def float_to_bf16(value: float) -> int:
     """Convert IEEE float32 to BF16 using round-to-nearest, ties-to-even."""
-    bits = struct.unpack(">I", struct.pack(">f", float(value)))[0]
+    try:
+        bits = struct.unpack(">I", struct.pack(">f", float(value)))[0]
+    except OverflowError:
+        bits = 0xFF800000 if float(value) < 0 else 0x7F800000
     # Keep NaNs as NaNs instead of rounding a quiet-NaN payload to infinity.
     if bits & 0x7F800000 == 0x7F800000 and bits & 0x007FFFFF:
-        return ((bits >> 16) | 0x0040) & 0xFFFF
+        return 0x7FC0
     upper, lower = bits >> 16, bits & 0xFFFF
     if lower > 0x8000 or (lower == 0x8000 and upper & 1):
         upper += 1
@@ -116,6 +120,8 @@ def _decode(reg: _Register, dtype: DataType | None = None) -> int | float:
         return bf16_to_float(reg.payload)
     if kind == DataType.U128:
         return reg.payload & MASK128
+    if kind == DataType.PRED:
+        return reg.payload & 1
     return _signed(reg.payload, _width(kind))
 
 
@@ -158,6 +164,19 @@ class Tile:
             return [_decode(self._rf[lane][register]) for lane in range(LANES)]
         return [self._rf[lane][register].payload for lane in range(LANES)]
 
+    def read_register_raw(self, register: int) -> list[tuple[int, DataType]]:
+        """Return payload/tag pairs in lane order for RTL comparison tools."""
+        if not 0 <= register < REGISTERS:
+            raise ValueError("register index out of range")
+        return [(self._rf[lane][register].payload, self._rf[lane][register].dtype)
+                for lane in range(LANES)]
+
+    def read_sram_raw(self, address: int) -> list[tuple[int, DataType]]:
+        if not 0 <= address < LOCAL_WORDS:
+            raise ValueError("local SRAM address out of range")
+        return [(self._sram[lane][address].payload, self._sram[lane][address].dtype)
+                for lane in range(LANES)]
+
     def load_sram(self, address: int, values: Sequence[int | float], dtype: DataType) -> None:
         if not 0 <= address < LOCAL_WORDS or len(values) != LANES:
             raise ValueError("expected a valid SRAM word and exactly 256 values")
@@ -169,7 +188,7 @@ class Tile:
         reg = self._sram[lane][address]
         return _decode(reg) if decoded else reg.payload
 
-    def step(self, insn: Instruction) -> None:
+    def step(self, insn: Instruction, *, neighbor_resolver=None) -> None:
         """Issue one tile-wide instruction; masked lanes retain their state."""
         op = insn.opcode
         dtype = insn.dtype
@@ -198,7 +217,12 @@ class Tile:
                 continue
             if op == Opcode.NEIGHBOR:
                 neighbor = self._neighbor_lane(lane, insn.imm)
-                reg = _Register(0, out_type) if neighbor is None else self._rf[neighbor][insn.src_a]
+                if neighbor is None and neighbor_resolver is not None:
+                    reg = neighbor_resolver(lane, insn.imm, insn.src_a)
+                else:
+                    reg = _Register(0, out_type) if neighbor is None else self._rf[neighbor][insn.src_a]
+                if reg is None:
+                    reg = _Register(0, out_type)
                 writes.append((lane, _Register(reg.payload, reg.dtype)))
                 continue
 
@@ -216,7 +240,10 @@ class Tile:
                 result = av * bv
             elif op == Opcode.MAC:
                 old = _decode(self._rf[lane][insn.dst], dtype)
-                result = old + av * bv
+                product = av * bv
+                if out_type == DataType.BF16:
+                    product = bf16_to_float(float_to_bf16(product))
+                result = old + product
             elif op == Opcode.AND:
                 result = int(a.payload) & int(b.payload)
             elif op == Opcode.OR:
@@ -228,9 +255,9 @@ class Tile:
             elif op == Opcode.SHR:
                 result = int(av) >> (int(bv) & 127)
             elif op == Opcode.MIN:
-                result = min(av, bv)
+                result = math.nan if out_type == DataType.BF16 and (math.isnan(av) or math.isnan(bv)) else min(av, bv)
             elif op == Opcode.MAX:
-                result = max(av, bv)
+                result = math.nan if out_type == DataType.BF16 and (math.isnan(av) or math.isnan(bv)) else max(av, bv)
             elif op == Opcode.SEL:
                 result = _decode(b, dtype) if a.payload else _decode(c, dtype)
             else:
@@ -251,6 +278,54 @@ class Tile:
         dx, dy = dxdy[direction]
         nx, ny = x + dx, y + dy
         return ny * 16 + nx if 0 <= nx < 16 and 0 <= ny < 16 else None
+
+
+class Mesh:
+    """Rectangular mesh of SIMD tiles with synchronous inter-tile halos."""
+
+    def __init__(self, tiles_x: int = 2, tiles_y: int = 2) -> None:
+        if tiles_x < 1 or tiles_y < 1:
+            raise ValueError("mesh dimensions must both be positive")
+        self.tiles_x = tiles_x
+        self.tiles_y = tiles_y
+        self.tiles = [[Tile() for _ in range(tiles_x)] for _ in range(tiles_y)]
+        self.cycles = 0
+
+    def tile_at(self, x: int, y: int) -> Tile:
+        if not (0 <= x < self.tiles_x and 0 <= y < self.tiles_y):
+            raise ValueError("tile coordinates are outside this mesh")
+        return self.tiles[y][x]
+
+    def step(self, insn: Instruction) -> None:
+        if insn.opcode != Opcode.NEIGHBOR:
+            for row in self.tiles:
+                for tile in row:
+                    tile.step(insn)
+            self.cycles += 1
+            return
+
+        # A neighbor instruction observes one mesh-wide pre-instruction snapshot.
+        snapshot = [[[[tile._rf[lane][register] for register in range(REGISTERS)]
+                      for lane in range(LANES)] for tile in row] for row in self.tiles]
+        directions = ((0, -1), (1, -1), (1, 0), (1, 1),
+                      (0, 1), (-1, 1), (-1, 0), (-1, -1))
+
+        for ty in range(self.tiles_y):
+            for tx in range(self.tiles_x):
+                def resolve(lane: int, direction: int, register: int,
+                            tile_x: int = tx, tile_y: int = ty):
+                    x, y = lane % 16, lane // 16
+                    dx, dy = directions[direction]
+                    gx, gy = tile_x * 16 + x + dx, tile_y * 16 + y + dy
+                    if not (0 <= gx < self.tiles_x * 16 and 0 <= gy < self.tiles_y * 16):
+                        return None
+                    target_tx, target_x = divmod(gx, 16)
+                    target_ty, target_y = divmod(gy, 16)
+                    target_lane = target_y * 16 + target_x
+                    return snapshot[target_ty][target_tx][target_lane][register]
+
+                self.tiles[ty][tx].step(insn, neighbor_resolver=resolve)
+        self.cycles += 1
 
     def run(self, program: Iterable[Instruction]) -> int:
         for insn in program:

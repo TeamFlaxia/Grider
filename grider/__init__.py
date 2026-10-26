@@ -1,5 +1,5 @@
 """Grider cellular-array processor reference model."""
 
-from .sim import DataType, Instruction, Opcode, Tile, gemm16
+from .sim import DataType, Instruction, Mesh, Opcode, Tile, gemm16
 
-__all__ = ["DataType", "Instruction", "Opcode", "Tile", "gemm16"]
+__all__ = ["DataType", "Instruction", "Mesh", "Opcode", "Tile", "gemm16"]
