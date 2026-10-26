@@ -6,6 +6,8 @@ The repository now contains a functional Python emulator, matching tile and mesh
 
 ## Architecture
 
+The complete instruction encoding and defined behavior are in [docs/isa.md](docs/isa.md).
+
 - Each cell has 16 typed 128-bit registers and 16 private 128-bit SRAM words. Each register or SRAM word carries a 4-bit type tag.
 - Supported numeric tags include signed INT4, INT8, INT16, INT32, INT64 and BF16, plus unsigned 128-bit bit vectors and predicates.
 - The instruction set includes MOV/MOVI, ADD/SUB/MUL/MAC, bitwise operations, shifts, MIN/MAX/SEL, local LOAD/STORE and 8-neighbor reads.

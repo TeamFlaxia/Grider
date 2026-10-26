@@ -1,9 +1,8 @@
-// Grider v0 tile datapath scaffold.
-// One decoder issues a single instruction to 256 lockstep cells. Each cell
-// owns a 16 x (128-bit payload + 4-bit type) register file and 16 local words.
-// This synthesizable subset implements integer/bitwise operations, MAC,
-// per-cell SRAM and same-tile 8-neighbor reads. BF16 and GEMM scheduling are
-// currently defined by the Python reference model / architecture document.
+// Grider v0 tile datapath.
+// One decoder issues a single instruction to lockstep cells. Each cell owns
+// typed registers and local SRAM. BF16 arithmetic, integer/bitwise operations,
+// synchronous state updates and same-tile eight-neighbor reads are implemented
+// here; the complete v0 behavior is specified in docs/isa.md.
 module grider_tile #(
     parameter integer TILE_W = 16,
     parameter integer TILE_H = 16,
@@ -83,8 +82,35 @@ module grider_tile #(
     localparam logic [3:0] DT_I16 = 4'h3;
     localparam logic [3:0] DT_I32 = 4'h4;
     localparam logic [3:0] DT_I64 = 4'h5;
-    // 4'hf asks the datapath to inherit the first source's type tag.
+    localparam logic [3:0] DT_U128 = 4'h6;
+    localparam logic [3:0] DT_PRED = 4'h7;
+    // 4'hf asks the datapath to inherit src_a's type (src_b for SEL).
     localparam logic [3:0] DT_INHERIT = 4'hf;
+
+    function automatic logic dtype_is_valid(input logic [3:0] tag);
+        begin
+            case (tag)
+                DT_I4, DT_I8, DT_BF16, DT_I16, DT_I32, DT_I64, DT_U128, DT_PRED:
+                    dtype_is_valid = 1'b1;
+                default: dtype_is_valid = 1'b0;
+            endcase
+        end
+    endfunction
+
+    function automatic logic opcode_supports_dtype(
+        input logic [4:0] operation,
+        input logic [3:0] tag
+    );
+        begin
+            case (operation)
+                OP_ADD, OP_SUB, OP_MUL, OP_MAC, OP_MIN, OP_MAX:
+                    opcode_supports_dtype =
+                        (tag == DT_I4) || (tag == DT_I8) || (tag == DT_BF16) ||
+                        (tag == DT_I16) || (tag == DT_I32) || (tag == DT_I64);
+                default: opcode_supports_dtype = 1'b1;
+            endcase
+        end
+    endfunction
 
     logic [127:0] rf_data [0:LANES-1][0:REG_COUNT-1];
     logic [3:0]   rf_type [0:LANES-1][0:REG_COUNT-1];
@@ -111,7 +137,8 @@ module grider_tile #(
     integer ny;
     integer neighbor;
 
-    assign instruction_ready = 1'b1;
+    // A host write takes the tile's state port for this cycle.
+    assign instruction_ready = rst_n && !host_write_enable;
 
     always_comb begin
         host_read_data = '0;
@@ -185,6 +212,7 @@ module grider_tile #(
                 DT_I16: truncate_by_type = {{112{1'b0}}, value[15:0]};
                 DT_I32: truncate_by_type = {{96{1'b0}}, value[31:0]};
                 DT_I64: truncate_by_type = {{64{1'b0}}, value[63:0]};
+                DT_PRED: truncate_by_type = {{127{1'b0}}, value[0]};
                 default: truncate_by_type = value;
             endcase
         end
@@ -414,24 +442,34 @@ module grider_tile #(
             lane_b[lane] = rf_data[lane][src_b];
             lane_c[lane] = rf_data[lane][src_c];
             lane_acc[lane] = rf_data[lane][dst];
-            if (dtype == DT_INHERIT)
-                lane_dtype[lane] = (opcode == OP_SEL) ? rf_type[lane][src_b] : rf_type[lane][src_a];
-            else
+            if (opcode == OP_SEL) begin
+                lane_dtype[lane] = (dtype == DT_INHERIT) ? rf_type[lane][src_b] : dtype;
+            end else if (opcode == OP_LOAD) begin
+                lane_dtype[lane] = sram_type[lane][immediate[3:0]];
+            end else if ((opcode == OP_MOV) || (opcode == OP_NEIGHBOR) || (opcode == OP_STORE)) begin
+                lane_dtype[lane] = rf_type[lane][src_a];
+            end else if (dtype == DT_INHERIT) begin
+                lane_dtype[lane] = rf_type[lane][src_a];
+            end else begin
                 lane_dtype[lane] = dtype;
+            end
             neighbor = -1;
             nx = 0;
             ny = 0;
 
-            if (instruction_valid && lane_mask[lane]) begin
+            if (instruction_valid && lane_mask[lane] &&
+                ((dtype == DT_INHERIT) || dtype_is_valid(dtype)) &&
+                dtype_is_valid(lane_dtype[lane]) &&
+                opcode_supports_dtype(opcode, lane_dtype[lane])) begin
                 case (opcode)
                     OP_NOP: begin end
                     OP_MOV: begin
-                        lane_result[lane] = lane_a[lane];
+                        lane_result[lane] = truncate_by_type(lane_a[lane], rf_type[lane][src_a]);
                         lane_result_type[lane] = rf_type[lane][src_a];
                         lane_write[lane] = 1'b1;
                     end
                     OP_MOVI: begin
-                        lane_result[lane] = immediate;
+                        lane_result[lane] = truncate_by_type(immediate, lane_dtype[lane]);
                         lane_result_type[lane] = lane_dtype[lane];
                         lane_write[lane] = 1'b1;
                     end
@@ -477,7 +515,14 @@ module grider_tile #(
                                 OP_OR:  lane_result[lane] = lane_a[lane] | lane_b[lane];
                                 OP_XOR: lane_result[lane] = lane_a[lane] ^ lane_b[lane];
                                 OP_SHL: lane_result[lane] = lane_a[lane] << lane_b[lane][6:0];
-                                OP_SHR: lane_result[lane] = signed_a >>> lane_b[lane][6:0];
+                                OP_SHR: begin
+                                    if ((lane_dtype[lane] == DT_U128) ||
+                                        (lane_dtype[lane] == DT_BF16) ||
+                                        (lane_dtype[lane] == DT_PRED))
+                                        lane_result[lane] = lane_a[lane] >> lane_b[lane][6:0];
+                                    else
+                                        lane_result[lane] = signed_a >>> lane_b[lane][6:0];
+                                end
                                 OP_MIN: lane_result[lane] = (signed_min_a < signed_min_b) ? signed_min_a : signed_min_b;
                                 OP_MAX: lane_result[lane] = (signed_min_a > signed_min_b) ? signed_min_a : signed_min_b;
                                 OP_SEL: lane_result[lane] = (lane_a[lane] != 0) ? lane_b[lane] : lane_c[lane];
@@ -508,28 +553,28 @@ module grider_tile #(
                             lane_result_type[lane] = rf_type[neighbor][src_a];
                         end else if ((nx < 0) && (ny < 0)) begin
                             lane_result[lane] = halo_north_west_valid ? halo_north_west[127:0] : '0;
-                            lane_result_type[lane] = halo_north_west_valid ? halo_north_west[131:128] : lane_dtype[lane];
+                            lane_result_type[lane] = halo_north_west_valid ? halo_north_west[131:128] : rf_type[lane][src_a];
                         end else if ((nx >= TILE_W) && (ny < 0)) begin
                             lane_result[lane] = halo_north_east_valid ? halo_north_east[127:0] : '0;
-                            lane_result_type[lane] = halo_north_east_valid ? halo_north_east[131:128] : lane_dtype[lane];
+                            lane_result_type[lane] = halo_north_east_valid ? halo_north_east[131:128] : rf_type[lane][src_a];
                         end else if ((nx < 0) && (ny >= TILE_H)) begin
                             lane_result[lane] = halo_south_west_valid ? halo_south_west[127:0] : '0;
-                            lane_result_type[lane] = halo_south_west_valid ? halo_south_west[131:128] : lane_dtype[lane];
+                            lane_result_type[lane] = halo_south_west_valid ? halo_south_west[131:128] : rf_type[lane][src_a];
                         end else if ((nx >= TILE_W) && (ny >= TILE_H)) begin
                             lane_result[lane] = halo_south_east_valid ? halo_south_east[127:0] : '0;
-                            lane_result_type[lane] = halo_south_east_valid ? halo_south_east[131:128] : lane_dtype[lane];
+                            lane_result_type[lane] = halo_south_east_valid ? halo_south_east[131:128] : rf_type[lane][src_a];
                         end else if (nx < 0) begin
                             lane_result[lane] = halo_west_valid[ny] ? halo_west[ny*132 +: 128] : '0;
-                            lane_result_type[lane] = halo_west_valid[ny] ? halo_west[ny*132+128 +: 4] : lane_dtype[lane];
+                            lane_result_type[lane] = halo_west_valid[ny] ? halo_west[ny*132+128 +: 4] : rf_type[lane][src_a];
                         end else if (nx >= TILE_W) begin
                             lane_result[lane] = halo_east_valid[ny] ? halo_east[ny*132 +: 128] : '0;
-                            lane_result_type[lane] = halo_east_valid[ny] ? halo_east[ny*132+128 +: 4] : lane_dtype[lane];
+                            lane_result_type[lane] = halo_east_valid[ny] ? halo_east[ny*132+128 +: 4] : rf_type[lane][src_a];
                         end else if (ny < 0) begin
                             lane_result[lane] = halo_north_valid[nx] ? halo_north[nx*132 +: 128] : '0;
-                            lane_result_type[lane] = halo_north_valid[nx] ? halo_north[nx*132+128 +: 4] : lane_dtype[lane];
+                            lane_result_type[lane] = halo_north_valid[nx] ? halo_north[nx*132+128 +: 4] : rf_type[lane][src_a];
                         end else if (ny >= TILE_H) begin
                             lane_result[lane] = halo_south_valid[nx] ? halo_south[nx*132 +: 128] : '0;
-                            lane_result_type[lane] = halo_south_valid[nx] ? halo_south[nx*132+128 +: 4] : lane_dtype[lane];
+                            lane_result_type[lane] = halo_south_valid[nx] ? halo_south[nx*132+128 +: 4] : rf_type[lane][src_a];
                         end else begin
                             lane_result[lane] = '0;
                             lane_result_type[lane] = lane_dtype[lane];
@@ -571,12 +616,12 @@ module grider_tile #(
         end else begin
             instruction_done <= 1'b0;
             if (host_write_enable) begin
-                if (host_lane < LANES) begin
+                if ((host_lane < LANES) && dtype_is_valid(host_write_type)) begin
                     if (host_memory_select && (host_index < SRAM_WORDS)) begin
-                        sram_data[host_lane][host_index] <= host_write_data;
+                        sram_data[host_lane][host_index] <= truncate_by_type(host_write_data, host_write_type);
                         sram_type[host_lane][host_index] <= host_write_type;
                     end else if (!host_memory_select && (host_index < REG_COUNT)) begin
-                        rf_data[host_lane][host_index] <= host_write_data;
+                        rf_data[host_lane][host_index] <= truncate_by_type(host_write_data, host_write_type);
                         rf_type[host_lane][host_index] <= host_write_type;
                     end
                 end

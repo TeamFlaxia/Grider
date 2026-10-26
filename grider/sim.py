@@ -95,6 +95,20 @@ def _pack(value: int, dtype: DataType) -> int:
     return value & ((1 << _width(dtype)) - 1)
 
 
+_NUMERIC_DTYPES = frozenset({
+    DataType.I4, DataType.I8, DataType.I16, DataType.I32, DataType.I64,
+    DataType.BF16,
+})
+_NUMERIC_OPS = frozenset({
+    Opcode.ADD, Opcode.SUB, Opcode.MUL, Opcode.MAC, Opcode.MIN, Opcode.MAX,
+})
+
+
+def _supports_dtype(op: Opcode, dtype: DataType) -> bool:
+    """Return whether the v0 ISA defines this arithmetic/type combination."""
+    return op not in _NUMERIC_OPS or dtype in _NUMERIC_DTYPES
+
+
 def float_to_bf16(value: float) -> int:
     """Convert IEEE float32 to BF16 using round-to-nearest, ties-to-even."""
     try:
@@ -189,79 +203,123 @@ class Tile:
         return _decode(reg) if decoded else reg.payload
 
     def step(self, insn: Instruction, *, neighbor_resolver=None) -> None:
-        """Issue one tile-wide instruction; masked lanes retain their state."""
-        op = insn.opcode
-        dtype = insn.dtype
-        if op == Opcode.NEIGHBOR and not 0 <= insn.imm < 8:
-            raise ValueError("NEIGHBOR imm encodes one of 8 directions (0..7)")
-        if op in (Opcode.LOAD, Opcode.STORE) and not 0 <= insn.imm < LOCAL_WORDS:
-            raise ValueError("local SRAM address must be in [0, 16)")
+        """Issue one instruction; reserved encodings complete as no-ops."""
+        try:
+            op = Opcode(int(insn.opcode))
+        except (TypeError, ValueError):
+            self.cycles += 1
+            return
 
-        # Stage all writes before committing, preserving SIMD and neighborhood semantics.
+        raw_dtype = insn.dtype
+        if raw_dtype is None:
+            dtype = None
+        else:
+            try:
+                dtype_value = int(raw_dtype)
+            except (TypeError, ValueError):
+                self.cycles += 1
+                return
+            if dtype_value == 0xF:
+                dtype = None
+            else:
+                try:
+                    dtype = DataType(dtype_value)
+                except ValueError:
+                    self.cycles += 1
+                    return
+
+        immediate = int(insn.imm) & MASK128
+        address = immediate & (LOCAL_WORDS - 1)
+        direction = immediate & 0x7
+
+        # Stage register writes before commit so in-place neighbor operations
+        # read the pre-instruction state.
         writes: list[tuple[int, _Register]] = []
         for lane in range(LANES):
             if not ((insn.lane_mask >> lane) & 1):
                 continue
+
             a = self._rf[lane][insn.src_a]
             b = self._rf[lane][insn.src_b]
             c = self._rf[lane][insn.src_c]
             out_type = dtype if dtype is not None else (b.dtype if op == Opcode.SEL else a.dtype)
+
             if op == Opcode.NOP:
                 continue
             if op == Opcode.STORE:
-                self._sram[lane][insn.imm] = _Register(a.payload, a.dtype)
+                self._sram[lane][address] = _Register(a.payload, a.dtype)
                 continue
             if op == Opcode.LOAD:
-                reg = self._sram[lane][insn.imm]
+                reg = self._sram[lane][address]
                 writes.append((lane, _Register(reg.payload, reg.dtype)))
                 continue
             if op == Opcode.NEIGHBOR:
-                neighbor = self._neighbor_lane(lane, insn.imm)
+                neighbor = self._neighbor_lane(lane, direction)
                 if neighbor is None and neighbor_resolver is not None:
-                    reg = neighbor_resolver(lane, insn.imm, insn.src_a)
+                    reg = neighbor_resolver(lane, direction, insn.src_a)
                 else:
-                    reg = _Register(0, out_type) if neighbor is None else self._rf[neighbor][insn.src_a]
+                    reg = _Register(0, a.dtype) if neighbor is None else self._rf[neighbor][insn.src_a]
                 if reg is None:
-                    reg = _Register(0, out_type)
+                    reg = _Register(0, a.dtype)
                 writes.append((lane, _Register(reg.payload, reg.dtype)))
                 continue
+            if not _supports_dtype(op, out_type):
+                continue
 
-            av = _decode(a, dtype)
-            bv = _decode(b, dtype)
             if op == Opcode.MOV:
-                result = av
-            elif op == Opcode.MOVI:
-                result = insn.imm
-            elif op == Opcode.ADD:
+                # MOV preserves the source tag; its dtype field is ignored.
+                payload = _pack(a.payload, a.dtype)
+                writes.append((lane, _Register(payload, a.dtype)))
+                continue
+            if op == Opcode.MOVI:
+                payload = _pack(immediate, out_type)
+                writes.append((lane, _Register(payload, out_type)))
+                continue
+            if op == Opcode.SEL:
+                selected = b if a.payload != 0 else c
+                payload = _pack(selected.payload, out_type)
+                writes.append((lane, _Register(payload, out_type)))
+                continue
+
+            # Arithmetic inherits one common operand type. SEL is handled
+            # above because its inherited result type comes from src_b.
+            av = _decode(a, out_type)
+            bv = _decode(b, out_type)
+            if op == Opcode.ADD:
                 result = av + bv
             elif op == Opcode.SUB:
                 result = av - bv
             elif op == Opcode.MUL:
                 result = av * bv
             elif op == Opcode.MAC:
-                old = _decode(self._rf[lane][insn.dst], dtype)
+                old = _decode(self._rf[lane][insn.dst], out_type)
                 product = av * bv
                 if out_type == DataType.BF16:
                     product = bf16_to_float(float_to_bf16(product))
                 result = old + product
             elif op == Opcode.AND:
-                result = int(a.payload) & int(b.payload)
+                result = a.payload & b.payload
             elif op == Opcode.OR:
-                result = int(a.payload) | int(b.payload)
+                result = a.payload | b.payload
             elif op == Opcode.XOR:
-                result = int(a.payload) ^ int(b.payload)
+                result = a.payload ^ b.payload
             elif op == Opcode.SHL:
-                result = int(a.payload) << (int(bv) & 127)
+                result = a.payload << (b.payload & 0x7F)
             elif op == Opcode.SHR:
-                result = int(av) >> (int(bv) & 127)
+                shift = b.payload & 0x7F
+                if out_type in (DataType.I4, DataType.I8, DataType.I16,
+                                DataType.I32, DataType.I64):
+                    result = int(av) >> shift
+                else:
+                    result = a.payload >> shift
             elif op == Opcode.MIN:
                 result = math.nan if out_type == DataType.BF16 and (math.isnan(av) or math.isnan(bv)) else min(av, bv)
             elif op == Opcode.MAX:
                 result = math.nan if out_type == DataType.BF16 and (math.isnan(av) or math.isnan(bv)) else max(av, bv)
-            elif op == Opcode.SEL:
-                result = _decode(b, dtype) if a.payload else _decode(c, dtype)
             else:
-                raise ValueError(f"unsupported opcode: {op}")
+                # Unknown v0 opcodes are defined as no-ops above.
+                continue
+
             payload = float_to_bf16(float(result)) if out_type == DataType.BF16 else _pack(int(result), out_type)
             writes.append((lane, _Register(payload, out_type)))
 
@@ -315,7 +373,7 @@ class Mesh:
                 def resolve(lane: int, direction: int, register: int,
                             tile_x: int = tx, tile_y: int = ty):
                     x, y = lane % 16, lane // 16
-                    dx, dy = directions[direction]
+                    dx, dy = directions[direction & 0x7]
                     gx, gy = tile_x * 16 + x + dx, tile_y * 16 + y + dy
                     if not (0 <= gx < self.tiles_x * 16 and 0 <= gy < self.tiles_y * 16):
                         return None
