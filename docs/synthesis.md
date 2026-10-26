@@ -49,7 +49,22 @@ The area fell by about 0.7%, while the estimated Fmax fell by about 22%. The sta
 
 The Sky130 flow generates a `64×128` payload macro and a `64×8` tag macro for each logical memory. The 16 architectural addresses use the first 16 rows; the extra depth is the smallest SRAM22 timing configuration. The valid bitmap remains in standard cells so reset does not clear the physical SRAM. This gives four hard macros per PE: two for the register file and two for local SRAM.
 
-SRAM22 emits Verilog, Liberty, LEF, GDS, and SPICE views. The timing libraries for this custom size use the generator's interpolated characterization; this run is pre-layout and does not run DRC/LVS or route the macros. Treat the macro timing as an integration estimate until physical verification is added.
+SRAM22 emits Verilog, Liberty, LEF, GDS, and SPICE views. The timing libraries for this custom size use the generator's interpolated characterization; this run is pre-layout and does not run DRC/LVS or route the macros.
+
+The CI run compares one PE with the default register-file/SRAM arrays mapped to standard cells against the optional SRAM22 path:
+
+| Measurement | Standard-cell fallback | SRAM22 macro path |
+|---|---:|---:|
+| Standard-cell area | 780,806.36 µm² | 620,223.59 µm² |
+| SRAM macro area from LEF | 0 µm² | 532,645.06 µm² |
+| Combined standard-cell + macro area | 780,806.36 µm² | 1,152,868.65 µm² |
+| Sequential standard-cell instances | 5,477 | 989 |
+| Physical SRAM macro instances | 0 | 4 |
+| Logical storage bits | 4,224 | 4,224 |
+| Physical SRAM capacity | 0 | 17,408 bits |
+| Derived pre-layout Fmax | 11.148 MHz | 20.982 MHz |
+
+The macro path's estimated Fmax is about 1.88× the fallback result, and its standard-cell area is lower. With 64-word macros serving 16 logical addresses, it allocates 4.1× the required memory capacity; counting the macro area, total area is about 47.7% higher. This is a speed-versus-area result, not an area reduction. A smaller macro or denser memory configuration would be needed to improve both measures.
 
 ## Timing and area interpretation
 
