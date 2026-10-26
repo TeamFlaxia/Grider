@@ -59,6 +59,14 @@ write_json build/sky130hd/mapped.json
 # Keep RTL port names, but hide complex source-derived internal names before STA export.
 rename -hide
 write_verilog -noattr -noexpr build/sky130hd/grider_tile_mapped.v
+# The mapped netlist is a structural cell graph; signedness on internal wires is unused.
+python3 - <<'PY'
+from pathlib import Path
+p = Path("build/sky130hd/grider_tile_mapped.v")
+text = p.read_text()
+text = text.replace("wire signed ", "wire ")
+p.write_text(text)
+PY
 YOSYS
 
 yosys -s build/sky130hd/memory.ys 2>&1 | tee build/sky130hd/memory.log
