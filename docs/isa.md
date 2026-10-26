@@ -1,6 +1,6 @@
 # Grider v0 instruction semantics
 
-This document defines the architectural behavior shared by the Python model and the RTL.
+This document defines the architectural behavior shared by the Python model and the RTL. The Python `Tile.step` API represents an already accepted instruction; it does not model host-port backpressure timing.
 
 ## Encoding and issue
 

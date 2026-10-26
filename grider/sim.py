@@ -63,6 +63,12 @@ class Instruction:
     lane_mask: int = (1 << LANES) - 1
 
     def __post_init__(self) -> None:
+        if not isinstance(self.opcode, int) or not 0 <= self.opcode < 32:
+            raise ValueError("opcode must fit the 5-bit instruction field")
+        if self.dtype is not None and (
+            not isinstance(self.dtype, int) or not 0 <= self.dtype < 16
+        ):
+            raise ValueError("dtype must fit the 4-bit instruction field")
         for name in ("dst", "src_a", "src_b", "src_c"):
             value = getattr(self, name)
             if not 0 <= value < REGISTERS:
