@@ -15,6 +15,7 @@ fi
 cat > build/sky130hd/param-check.ys <<'YOSYS'
 read_verilog -defer -sv rtl/grider_tile.sv
 hierarchy -check -chparam TILE_W 1 -chparam TILE_H 1 -chparam LANES 1 -top grider_tile
+proc
 write_json build/sky130hd/param-check.json
 YOSYS
 

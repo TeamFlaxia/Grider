@@ -36,6 +36,7 @@ jobs:
           path: |
             build/sky130hd/report.md
             build/sky130hd/tool-versions.txt
+            build/sky130hd/param-check.log
             build/sky130hd/pre-map-stat.txt
             build/sky130hd/mapped-stat.txt
             build/sky130hd/memory.log
