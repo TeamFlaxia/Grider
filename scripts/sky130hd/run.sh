@@ -112,6 +112,15 @@ write_verilog -noattr -noexpr build/sky130hd/grider_tile_macro_mapped.v
 YOSYS
 
 yosys -s build/sky130hd/macro-map.ys 2>&1 | tee build/sky130hd/macro-map.log
+# OpenSTA's Verilog reader does not accept signed net declarations in the
+# mapped output. Keep the same neutralization used for the standard-cell run.
+python3 - <<'PY'
+from pathlib import Path
+p = Path("build/sky130hd/grider_tile_macro_mapped.v")
+text = p.read_text()
+text = text.replace("wire signed ", "wire ")
+p.write_text(text)
+PY
 docker run --rm \
   -v "$PWD:/work" \
   -w /work \
