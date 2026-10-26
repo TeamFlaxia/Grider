@@ -37,14 +37,19 @@ for label, data in (("pre-map", pre), ("mapped", mapped)):
 
 memories = [cell for cell in all_cells(pre) if cell.get("type", "").startswith("$mem")]
 memory_bits = 0
+memory_shapes = []
 for cell in memories:
     params = cell.get("parameters", {})
     width = params.get("WIDTH")
     size = params.get("SIZE")
     if width is not None and size is not None:
-        memory_bits += parameter_int(width) * parameter_int(size)
+        width = parameter_int(width)
+        size = parameter_int(size)
+        memory_bits += width * size
+        memory_shapes.append(f"{size} words × {width} bit")
 
 mapped_cells = list(all_cells(mapped))
+mapped_cell_count = len(mapped_cells)
 mapped_ram_cells = [
     cell for cell in mapped_cells
     if re.search(r"(?:^|__)(?:s?ram|memory)", cell.get("type", ""), re.IGNORECASE)
@@ -64,11 +69,18 @@ if not area_matches:
 area_um2 = float(area_matches[-1].replace(",", ""))
 
 sta = (OUT / "sta.log").read_text()
+number = r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
 slack_matches = re.findall(
-    r"slack\s+\((?:MET|VIOLATED)\)\s+([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)",
+    r"(?m)^[ \t]*" + number + r"[ \t]+slack[ \t]+\((?:MET|VIOLATED)\)",
     sta,
     re.IGNORECASE,
 )
+if not slack_matches:
+    slack_matches = re.findall(
+        r"slack[ \t]+\((?:MET|VIOLATED)\)[ \t]+" + number,
+        sta,
+        re.IGNORECASE,
+    )
 if not slack_matches:
     raise SystemExit("OpenSTA did not report a constrained register-to-register path slack")
 worst_slack_ns = min(float(value) for value in slack_matches)
@@ -82,7 +94,7 @@ pdk_commit = pdk_commit_file.read_text().strip() if pdk_commit_file.exists() els
 tool_versions = (OUT / "tool-versions.txt").read_text().strip()
 
 abstract_memory = (
-    f"{len(memories)} cell(s), {memory_bits} bit(s)"
+    f"{len(memories)} cell(s), {memory_bits} bit(s) ({', '.join(memory_shapes)})"
     if memories else "0 cells (RTL arrays were not retained as abstract Yosys memories)"
 )
 report = f"""# Sky130HD synthesis baseline: one PE
@@ -91,6 +103,7 @@ report = f"""# Sky130HD synthesis baseline: one PE
 |---|---:|
 | Configuration | TILE_W=1, TILE_H=1, LANES=1 |
 | Mapped Sky130HD standard-cell area | {area_um2:,.2f} µm² |
+| Mapped standard-cell instances | {mapped_cell_count:,} |
 | Mapped flip-flop instances | {flop_count:,} |
 | Abstract Yosys memories after memory_collect | {abstract_memory} |
 | RAM/SRAM macro instances in mapped netlist | {len(mapped_ram_cells)} |

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+OPENROAD_IMAGE=openroad/orfs@sha256:6810dbf0e03dddbc89ed8c0a1e13cad09ce4c98d40c4ac0ab99fdc04b0676347
 mkdir -p build/sky130hd
 if [[ ! -s "$SKY130HD_LIB" ]]; then
   echo "Missing Sky130HD Liberty file: $SKY130HD_LIB" >&2
@@ -9,7 +10,8 @@ fi
 
 {
   yosys -V
-  docker run --rm openroad/orfs:latest bash -lc \
+  echo "OpenROAD container: $OPENROAD_IMAGE"
+  docker run --rm "$OPENROAD_IMAGE" bash -lc \
     'source /OpenROAD-flow-scripts/env.sh && openroad -version'
 } > build/sky130hd/tool-versions.txt 2>&1
 
@@ -75,7 +77,7 @@ docker run --rm \
   -v "$PWD:/work" \
   -w /work \
   -e SKY130HD_LIB="$SKY130HD_LIB" \
-  openroad/orfs:latest \
+  "$OPENROAD_IMAGE" \
   bash -lc 'source /OpenROAD-flow-scripts/env.sh && openroad -exit scripts/sky130hd/sta.tcl' \
   2>&1 | tee build/sky130hd/sta.log
 python3 scripts/sky130hd/summarize.py

@@ -7,4 +7,4 @@ link_design grider_tile
 create_clock -name core_clk -period 100.0 [get_ports clk]
 set_clock_transition 0.10 [get_clocks core_clk]
 set_clock_uncertainty 0.0 [get_clocks core_clk]
-report_checks -path_delay max -from [all_registers] -to [all_registers] -format full_clock_expanded
+report_checks -path_delay max -from [all_registers] -to [all_registers] -format full_clock_expanded -digits 4
