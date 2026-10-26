@@ -7,7 +7,8 @@ This document defines the architectural behavior shared by the Python model and 
 - Opcodes 0 through 17 are defined by the instruction table in `architecture.md`. Reserved opcodes 18 through 31 are no-ops.
 - Data type tags 0 through 7 are defined. Tag `0xf` means inherit the source type described below; tags 8 through 14 are reserved.
 - A reserved opcode or reserved type tag completes as a no-op: registers and SRAM remain unchanged. The RTL still pulses `instruction_done` for a valid/ready issue.
-- An instruction is accepted on a rising edge when `instruction_valid && instruction_ready`. While a host write owns the tile state port, `instruction_ready` is low. Keep `instruction_valid` asserted until the instruction is accepted.
+- An instruction is accepted on a rising edge when `rst_n && instruction_valid && instruction_ready`. `instruction_ready` is low during reset or while any tile's host write port is active. A mesh broadcasts an instruction only when every tile is ready, so a stalled issue has no partial side effects. Keep `instruction_valid` asserted until acceptance.
+- `instruction_done` is a registered acknowledgment of the preceding rising edge: it is high after an edge that accepted an instruction and low after an edge that accepted none. Back-to-back accepted instructions can keep it high on consecutive cycles. A host-write stall leaves it low.
 - Inactive lanes preserve their register and SRAM state.
 
 ## Payload representation

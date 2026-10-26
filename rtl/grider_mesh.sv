@@ -58,6 +58,7 @@ module grider_mesh #(
     wire [131:0] edge_south_west [0:TILE_COUNT-1];
     wire [131:0] edge_north_west [0:TILE_COUNT-1];
     wire [TILE_COUNT-1:0] tile_ready;
+    wire mesh_issue_valid;
     wire [TILE_COUNT-1:0] tile_done;
     wire [127:0] tile_host_data [0:TILE_COUNT-1];
     wire [3:0] tile_host_type [0:TILE_COUNT-1];
@@ -131,7 +132,7 @@ module grider_mesh #(
                     (host_tile_x == tx) && (host_tile_y == ty);
                 grider_tile #(.TILE_W(TILE_W), .TILE_H(TILE_H), .LANES(TILE_W*TILE_H)) tile (
                     .clk(clk), .rst_n(rst_n),
-                    .instruction_valid(instruction_valid),
+                    .instruction_valid(mesh_issue_valid),
                     .instruction_ready(tile_ready[IDX]),
                     .instruction_done(tile_done[IDX]),
                     .host_write_enable(tile_host_write[IDX]),
@@ -181,5 +182,8 @@ module grider_mesh #(
     end
 
     assign instruction_ready = &tile_ready;
+    // A mesh instruction is atomic: do not let ready tiles execute while any
+    // tile is blocked by its host write port or reset.
+    assign mesh_issue_valid = instruction_valid && instruction_ready;
     assign instruction_done = &tile_done;
 endmodule

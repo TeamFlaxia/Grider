@@ -61,7 +61,12 @@ module tb_grider_tile;
             host_index = index[3:0];
             host_write_data = data;
             host_write_type = tag;
+            #1;
+            if (instruction_ready !== 1'b0)
+                $fatal(1, "host write must deassert instruction_ready");
             @(posedge clk); #1;
+            if (instruction_done !== 1'b0)
+                $fatal(1, "host write without an accepted instruction must leave done low");
             host_write_enable = 1'b0;
         end
     endtask
@@ -75,8 +80,12 @@ module tb_grider_tile;
             opcode = op[4:0]; dst = d[3:0]; src_a = a[3:0];
             src_b = b[3:0]; src_c = c[3:0]; immediate = imm;
             dtype = tag; lane_mask = mask; instruction_valid = 1'b1;
+            #1;
+            if (instruction_ready !== 1'b1)
+                $fatal(1, "instruction was not ready before the accepting edge");
             @(posedge clk); #1;
-            if (!instruction_done) $fatal(1, "instruction did not complete");
+            if (instruction_done !== 1'b1)
+                $fatal(1, "accepted instruction did not assert done");
             instruction_valid = 1'b0;
         end
     endtask
@@ -110,8 +119,17 @@ module tb_grider_tile;
         host_memory_select = 1'b0;
         host_lane = '0;
         host_index = '0;
+        #1;
+        if (instruction_ready !== 1'b0)
+            $fatal(1, "instruction_ready must be low during reset");
         repeat (2) @(posedge clk);
+        #1;
+        if (instruction_done !== 1'b0)
+            $fatal(1, "instruction_done must be low during reset");
         @(negedge clk); rst_n = 1'b1;
+        #1;
+        if (instruction_ready !== 1'b1 || instruction_done !== 1'b0)
+            $fatal(1, "reset release must leave the interface ready and idle");
 
         if (!$value$plusargs("STIM=%s", stim_path)) $fatal(1, "missing +STIM path");
         fd = $fopen(stim_path, "r");
@@ -135,6 +153,37 @@ module tb_grider_tile;
             end
         end
         $fclose(fd);
+
+        // A host write stalls a valid instruction. The same NOP is accepted
+        // after the host write releases the state port.
+        host_memory_select = 1'b0; host_lane = 0; host_index = 0; #1;
+        data = host_read_data; tag = host_read_type;
+        @(negedge clk);
+        host_write_enable = 1'b1; host_memory_select = 1'b0;
+        host_lane = 0; host_index = 0;
+        host_write_data = data; host_write_type = tag;
+        opcode = 5'd0; dst = 0; src_a = 0; src_b = 0; src_c = 0;
+        immediate = '0; dtype = 4'hf; lane_mask = '1;
+        instruction_valid = 1'b1;
+        #1;
+        if (instruction_ready !== 1'b0)
+            $fatal(1, "host write must deassert instruction_ready");
+        @(posedge clk); #1;
+        if (instruction_done !== 1'b0)
+            $fatal(1, "stalled instruction must not assert done");
+        @(negedge clk);
+        host_write_enable = 1'b0;
+        #1;
+        if (instruction_ready !== 1'b1)
+            $fatal(1, "instruction_ready must return after host write");
+        @(posedge clk); #1;
+        if (instruction_done !== 1'b1)
+            $fatal(1, "held instruction must complete after acceptance");
+        @(negedge clk);
+        instruction_valid = 1'b0;
+        @(posedge clk); #1;
+        if (instruction_done !== 1'b0)
+            $fatal(1, "instruction_done must clear when no instruction is accepted");
 
         for (lane = 0; lane < LANES; lane = lane + 1) begin
             for (r = 0; r < 16; r = r + 1) begin
