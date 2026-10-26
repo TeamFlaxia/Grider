@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report a technology-independent Yosys coarse-synthesis baseline."""
+"""Report Yosys memory inference and structural state for one Grider PE."""
 
 from __future__ import annotations
 
@@ -12,36 +12,24 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RTL = ROOT / "rtl" / "grider_tile.sv"
 OUT = ROOT / "build" / "synthesis"
-CONFIGS = (("pe-1x1", 1, 1), ("tile-2x2", 2, 2))
+WIDTH = 1
+HEIGHT = 1
+LANES = WIDTH * HEIGHT
 
 
-def read_cell_counts(path: Path) -> dict[str, int]:
-    report = json.loads(path.read_text())
-    counts: dict[str, int] = {}
-    for module in report.get("modules", {}).values():
-        for cell, count in module.get("num_cells_by_type", {}).items():
-            counts[cell] = counts.get(cell, 0) + int(count)
-    return counts
-
-
-def run_config(name: str, width: int, height: int) -> dict[str, object]:
-    lanes = width * height
-    out = OUT / name
-    out.mkdir(parents=True, exist_ok=True)
-    premap = out / "premap.json"
-    coarse = out / "coarse.json"
-    log_path = out / "yosys.log"
+def main() -> int:
+    OUT.mkdir(parents=True, exist_ok=True)
+    premap = OUT / "premap.json"
+    log_path = OUT / "yosys.log"
     commands = f"""
 read_verilog -sv {RTL}
-chparam -set TILE_W {width} -set TILE_H {height} -set LANES {lanes} grider_tile
+chparam -set TILE_W {WIDTH} -set TILE_H {HEIGHT} -set LANES {LANES} grider_tile
 hierarchy -check -purge -top grider_tile
 proc
 opt
 memory_dff
 memory_collect
 tee -o {premap} stat -json
-synth -top grider_tile -flatten -run begin:coarse
-tee -o {coarse} stat -json
 """
     with log_path.open("w") as log:
         result = subprocess.run(
@@ -54,66 +42,55 @@ tee -o {coarse} stat -json
         )
     if result.returncode:
         tail = log_path.read_text(errors="replace").splitlines()[-80:]
-        raise RuntimeError(f"Yosys failed for {name}:\n" + "\n".join(tail))
+        raise RuntimeError(f"Yosys failed:\n" + "\n".join(tail))
 
-    premap_counts = read_cell_counts(premap)
-    coarse_counts = read_cell_counts(coarse)
-    memory_count = sum(
-        count for cell, count in premap_counts.items() if "mem" in cell.lower()
+    report = json.loads(premap.read_text())
+    cell_counts: dict[str, int] = {}
+    memory_bits = 0
+    for module in report.get("modules", {}).values():
+        memory_bits += int(module.get("num_memory_bits", 0))
+        for cell, count in module.get("num_cells_by_type", {}).items():
+            cell_counts[cell] = cell_counts.get(cell, 0) + int(count)
+
+    memory_cells = sum(
+        count for cell, count in cell_counts.items() if "mem" in cell.lower()
     )
-    multiplier_count = sum(
-        count for cell, count in coarse_counts.items()
-        if "mul" in cell.lower() or "macc" in cell.lower()
+    async_cells = sum(
+        count for cell, count in cell_counts.items() if "adff" in cell.lower()
     )
-    return {
-        "configuration": name,
-        "tile_width": width,
-        "tile_height": height,
-        "lanes": lanes,
-        "architectural_state_bits": lanes * (16 + 16) * 132,
-        "premap_memory_cells": memory_count,
-        "coarse_cell_count": sum(coarse_counts.values()),
-        "coarse_multiplier_cells": multiplier_count,
-        "premap_cell_types": premap_counts,
-        "coarse_cell_types": coarse_counts,
-    }
+    state_bits = LANES * (16 + 16) * 132
+    summary = f"""# Grider Yosys memory-inference report
 
+Tool: {subprocess.check_output(["yosys", "-V"], text=True).strip()}
 
-def main() -> int:
-    OUT.mkdir(parents=True, exist_ok=True)
-    version = subprocess.check_output(["yosys", "-V"], text=True).strip()
-    results = [run_config(name, width, height) for name, width, height in CONFIGS]
-    report = {"yosys_version": version, "results": results}
-    (OUT / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
+| Configuration | Lanes | Architectural state bits | Yosys memory cells | Yosys memory bits | Async-reset cell types |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| {WIDTH}×{HEIGHT} PE | {LANES} | {state_bits:,} | {memory_cells:,} | {memory_bits:,} | {async_cells:,} |
 
-    lines = [
-        "# Grider Yosys coarse-synthesis baseline",
-        "",
-        f"Tool: {version}",
-        "",
-        "| Configuration | Lanes | State bits | Premap memory cells | Coarse cells | Multiplier/MACC cells |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    for item in results:
-        lines.append(
-            "| {configuration} | {lanes} | {architectural_state_bits:,} | "
-            "{premap_memory_cells:,} | {coarse_cell_count:,} | "
-            "{coarse_multiplier_cells:,} |".format(**item)
+This report stops before memory mapping. It measures memory inference and structural state, not physical area.
+Fmax and physical area require a target device or standard-cell library and timing constraints.
+"""
+    (OUT / "summary.json").write_text(
+        json.dumps(
+            {
+                "yosys_version": subprocess.check_output(
+                    ["yosys", "-V"], text=True
+                ).strip(),
+                "lanes": LANES,
+                "architectural_state_bits": state_bits,
+                "memory_cells": memory_cells,
+                "memory_bits": memory_bits,
+                "async_reset_cells": async_cells,
+                "cell_types": cell_counts,
+            },
+            indent=2,
         )
-    lines.extend(
-        [
-            "",
-            "Coarse Yosys cell counts are structural metrics, not physical area.",
-            "Fmax is not reported because this repository does not select a target device or cell library "
-            "and has no clock or I/O timing constraints.",
-            "",
-        ]
+        + "\n"
     )
-    summary = "\n".join(lines)
     (OUT / "summary.md").write_text(summary)
-    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary_path:
-        with Path(summary_path).open("a") as stream:
+    step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if step_summary:
+        with Path(step_summary).open("a") as stream:
             stream.write(summary)
     print(summary)
     return 0
