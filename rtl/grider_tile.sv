@@ -451,6 +451,8 @@ module grider_tile #(
                 lane_dtype[lane] = dtype;
             end
             neighbor = -1;
+            x = 0;
+            y = 0;
             nx = 0;
             ny = 0;
 
