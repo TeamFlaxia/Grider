@@ -8,6 +8,8 @@ jobs:
   sky130hd-one-pe:
     runs-on: ubuntu-22.04
     timeout-minutes: 20
+    env:
+      SKY130HD_LIB: build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
     steps:
       - uses: actions/checkout@v4
       - uses: YosysHQ/setup-oss-cad-suite@v4
