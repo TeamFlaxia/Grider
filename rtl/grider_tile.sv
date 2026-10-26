@@ -20,6 +20,7 @@ module grider_tile #(
     input  logic [3:0]            dst,
     input  logic [3:0]            src_a,
     input  logic [3:0]            src_b,
+    input  logic [3:0]            src_c,
     input  logic [127:0]          immediate,
     input  logic [3:0]            dtype,
     input  logic [LANES-1:0]      lane_mask
@@ -63,6 +64,7 @@ module grider_tile #(
     logic         lane_store [0:LANES-1];
     logic [127:0] lane_a [0:LANES-1];
     logic [127:0] lane_b [0:LANES-1];
+    logic [127:0] lane_c [0:LANES-1];
     logic [127:0] lane_acc [0:LANES-1];
     logic [3:0]   lane_dtype [0:LANES-1];
     logic signed [127:0] signed_a;
@@ -121,8 +123,12 @@ module grider_tile #(
             lane_store[lane] = 1'b0;
             lane_a[lane] = rf_data[lane][src_a];
             lane_b[lane] = rf_data[lane][src_b];
+            lane_c[lane] = rf_data[lane][src_c];
             lane_acc[lane] = rf_data[lane][dst];
-            lane_dtype[lane] = (dtype == DT_INHERIT) ? rf_type[lane][src_a] : dtype;
+            if (dtype == DT_INHERIT)
+                lane_dtype[lane] = (opcode == OP_SEL) ? rf_type[lane][src_b] : rf_type[lane][src_a];
+            else
+                lane_dtype[lane] = dtype;
             neighbor = -1;
             nx = 0;
             ny = 0;
@@ -159,7 +165,7 @@ module grider_tile #(
                             OP_SHR: lane_result[lane] = signed_a >>> lane_b[lane][6:0];
                             OP_MIN: lane_result[lane] = (signed_min_a < signed_min_b) ? signed_min_a : signed_min_b;
                             OP_MAX: lane_result[lane] = (signed_min_a > signed_min_b) ? signed_min_a : signed_min_b;
-                            OP_SEL: lane_result[lane] = (lane_a[lane] != 0) ? lane_a[lane] : lane_b[lane];
+                            OP_SEL: lane_result[lane] = (lane_a[lane] != 0) ? lane_b[lane] : lane_c[lane];
                             default: lane_result[lane] = '0;
                         endcase
                         lane_result[lane] = truncate_by_type(lane_result[lane], lane_dtype[lane]);

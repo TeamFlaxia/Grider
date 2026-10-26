@@ -28,7 +28,7 @@ The tag travels with each register value. Arithmetic uses the instruction's expl
 | `MOV`, `MOVI` | move a register value or sign/zero-truncated immediate |
 | `ADD`, `SUB`, `MUL`, `MAC` | lane-wise arithmetic; `MAC` adds `src_a × src_b` to old `dst` |
 | `AND`, `OR`, `XOR`, `SHL`, `SHR` | general bit operations |
-| `MIN`, `MAX`, `SEL` | lane-wise compare/select |
+| `MIN`, `MAX`, `SEL` | lane-wise compare; `SEL` uses `src_a` as predicate, `src_b` for true and `src_c` for false |
 | `NEIGHBOR` | copy `src_a` from one of the eight neighboring cells |
 | `LOAD`, `STORE` | access one word of the issuing cell's local SRAM |
 

@@ -56,12 +56,13 @@ class Instruction:
     dst: int = 0
     src_a: int = 0
     src_b: int = 0
+    src_c: int = 0
     imm: int = 0
     dtype: DataType | None = None
     lane_mask: int = (1 << LANES) - 1
 
     def __post_init__(self) -> None:
-        for name in ("dst", "src_a", "src_b"):
+        for name in ("dst", "src_a", "src_b", "src_c"):
             value = getattr(self, name)
             if not 0 <= value < REGISTERS:
                 raise ValueError(f"{name} must be in [0, {REGISTERS})")
@@ -184,7 +185,8 @@ class Tile:
                 continue
             a = self._rf[lane][insn.src_a]
             b = self._rf[lane][insn.src_b]
-            out_type = dtype if dtype is not None else a.dtype
+            c = self._rf[lane][insn.src_c]
+            out_type = dtype if dtype is not None else (b.dtype if op == Opcode.SEL else a.dtype)
             if op == Opcode.NOP:
                 continue
             if op == Opcode.STORE:
@@ -230,7 +232,7 @@ class Tile:
             elif op == Opcode.MAX:
                 result = max(av, bv)
             elif op == Opcode.SEL:
-                result = av if a.payload else bv
+                result = _decode(b, dtype) if a.payload else _decode(c, dtype)
             else:
                 raise ValueError(f"unsupported opcode: {op}")
             payload = float_to_bf16(float(result)) if out_type == DataType.BF16 else _pack(int(result), out_type)
