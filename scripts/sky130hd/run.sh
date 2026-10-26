@@ -7,9 +7,24 @@ if [[ ! -s "$SKY130HD_LIB" ]]; then
   echo "Missing Sky130HD Liberty file: $SKY130HD_LIB" >&2
   exit 2
 fi
+SRAM22_DATA_DIR=build/sky130hd/sram22/sram22_64x128m4w8
+SRAM22_TAG_DIR=build/sky130hd/sram22/sram22_64x8m4w8
+for required_view in \
+  "$SRAM22_DATA_DIR/sram22_64x128m4w8.v" \
+  "$SRAM22_DATA_DIR/sram22_64x128m4w8.lef" \
+  "$SRAM22_DATA_DIR/sram22_64x128m4w8_tt_025C_1v80.lib" \
+  "$SRAM22_TAG_DIR/sram22_64x8m4w8.v" \
+  "$SRAM22_TAG_DIR/sram22_64x8m4w8.lef" \
+  "$SRAM22_TAG_DIR/sram22_64x8m4w8_tt_025C_1v80.lib"; do
+  if [[ ! -s "$required_view" ]]; then
+    echo "Missing generated SRAM22 view: $required_view" >&2
+    exit 2
+  fi
+done
 
 {
   yosys -V
+  sram22 --version
   echo "OpenROAD container: $OPENROAD_IMAGE"
   docker run --rm "$OPENROAD_IMAGE" bash -lc \
     'source /OpenROAD-flow-scripts/env.sh && openroad -version'
@@ -80,6 +95,30 @@ docker run --rm \
   "$OPENROAD_IMAGE" \
   bash -lc 'source /OpenROAD-flow-scripts/env.sh && openroad -exit scripts/sky130hd/sta.tcl' \
   2>&1 | tee build/sky130hd/sta.log
+
+cat > build/sky130hd/macro-map.ys <<'YOSYS'
+read_verilog -defer -DGRIDER_USE_SRAM22 -sv rtl/grider_tile.sv
+read_liberty -lib build/sky130hd/sram22/sram22_64x128m4w8/sram22_64x128m4w8_tt_025C_1v80.lib
+read_liberty -lib build/sky130hd/sram22/sram22_64x8m4w8/sram22_64x8m4w8_tt_025C_1v80.lib
+hierarchy -check -chparam TILE_W 1 -chparam TILE_H 1 -chparam LANES 1 -top grider_tile
+synth -top grider_tile -noabc
+dfflibmap -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
+abc -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
+clean
+tee -o build/sky130hd/macro-mapped-stat.txt stat -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
+write_json build/sky130hd/macro-mapped.json
+rename -hide
+write_verilog -noattr -noexpr build/sky130hd/grider_tile_macro_mapped.v
+YOSYS
+
+yosys -s build/sky130hd/macro-map.ys 2>&1 | tee build/sky130hd/macro-map.log
+docker run --rm \
+  -v "$PWD:/work" \
+  -w /work \
+  -e SKY130HD_LIB="$SKY130HD_LIB" \
+  "$OPENROAD_IMAGE" \
+  bash -lc 'source /OpenROAD-flow-scripts/env.sh && openroad -exit scripts/sky130hd/sta_macro.tcl' \
+  2>&1 | tee build/sky130hd/sta-macro.log
 python3 scripts/sky130hd/summarize.py
 cat build/sky130hd/report.md >> "$GITHUB_STEP_SUMMARY"
 

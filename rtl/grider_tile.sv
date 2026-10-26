@@ -269,14 +269,54 @@ module grider_tile #(
     genvar memory_lane;
     generate
         for (memory_lane = 0; memory_lane < LANES; memory_lane = memory_lane + 1) begin : lane_memories
-            logic [131:0] register_words [0:REG_COUNT-1];
             logic [REG_COUNT-1:0] register_valid;
             logic [131:0] register_read_q;
             logic register_read_valid_q;
-            logic [131:0] local_sram_words [0:SRAM_WORDS-1];
             logic [SRAM_WORDS-1:0] local_sram_valid;
             logic [131:0] local_sram_read_q;
             logic local_sram_read_valid_q;
+
+`ifdef GRIDER_USE_SRAM22
+            logic [127:0] register_payload_q;
+            logic [7:0] register_tag_q;
+            logic [127:0] local_sram_payload_q;
+            logic [7:0] local_sram_tag_q;
+
+            // SRAM22 reset inhibits access; the validity bitmap supplies the
+            // architectural zero value without clearing macro contents.
+            sram22_64x128m4w8 register_payload_macro (
+                .clk(clk), .rstb(rst_n),
+                .ce(rf_port_enable[memory_lane]), .we(rf_port_write[memory_lane]),
+                .wmask(16'hffff), .addr({2'b00, rf_port_address[memory_lane]}),
+                .din(rf_port_write_data[memory_lane][127:0]),
+                .dout(register_payload_q)
+            );
+            sram22_64x8m4w8 register_tag_macro (
+                .clk(clk), .rstb(rst_n),
+                .ce(rf_port_enable[memory_lane]), .we(rf_port_write[memory_lane]),
+                .wmask(1'b1), .addr({2'b00, rf_port_address[memory_lane]}),
+                .din({4'b0, rf_port_write_data[memory_lane][131:128]}),
+                .dout(register_tag_q)
+            );
+            sram22_64x128m4w8 local_sram_payload_macro (
+                .clk(clk), .rstb(rst_n),
+                .ce(sram_port_enable[memory_lane]), .we(sram_port_write[memory_lane]),
+                .wmask(16'hffff), .addr({2'b00, sram_port_address[memory_lane]}),
+                .din(sram_port_write_data[memory_lane][127:0]),
+                .dout(local_sram_payload_q)
+            );
+            sram22_64x8m4w8 local_sram_tag_macro (
+                .clk(clk), .rstb(rst_n),
+                .ce(sram_port_enable[memory_lane]), .we(sram_port_write[memory_lane]),
+                .wmask(1'b1), .addr({2'b00, sram_port_address[memory_lane]}),
+                .din({4'b0, sram_port_write_data[memory_lane][131:128]}),
+                .dout(local_sram_tag_q)
+            );
+            assign register_read_q = {register_tag_q[3:0], register_payload_q};
+            assign local_sram_read_q = {local_sram_tag_q[3:0], local_sram_payload_q};
+`else
+            logic [131:0] register_words [0:REG_COUNT-1];
+            logic [131:0] local_sram_words [0:SRAM_WORDS-1];
 
             // Synchronous one-port read/write. The valid bitmap resets instead
             // of clearing every payload word, preserving SRAM inference.
@@ -300,6 +340,7 @@ module grider_tile #(
                     end
                 end
             end
+`endif
 
             always_ff @(posedge clk or negedge rst_n) begin
                 if (!rst_n) begin

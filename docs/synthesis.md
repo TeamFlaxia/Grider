@@ -31,7 +31,7 @@ The mapped flip-flop count matches the 4,224 architectural state bits plus the r
 
 The RTL packs the payload and type tag into one word, uses a synchronous read/write port per memory, and keeps reset state in a valid bitmap. A command reads its sources, executes, and writes back before another command is accepted. Reads, execution, and writeback occupy separate stages, but the stages do not overlap different instructions.
 
-The Sky130HD run checked one PE (`TILE_W=1`, `TILE_H=1`, `LANES=1`) and found two abstract 16×132 memories for the register file and local SRAM. Six small one-bit memories also remain for control state. The standard-cell-only flow has no SRAM macro model, so it expands the memory arrays into standard cells.
+The Sky130HD run checked one PE (`TILE_W=1`, `TILE_H=1`, `LANES=1`) and found two abstract 16×132 memories for the register file and local SRAM. Six small one-bit memories also remain for control state. The default standard-cell path expands the two arrays into standard cells. A separate `GRIDER_USE_SRAM22` path instantiates generated payload and tag macros, and supplies their Liberty and LEF views to synthesis and timing analysis.
 
 | Measurement | Current staged RTL | Earlier RTL |
 |---|---:|---:|
@@ -43,7 +43,13 @@ The Sky130HD run checked one PE (`TILE_W=1`, `TILE_H=1`, `LANES=1`) and found tw
 | Worst slack at a 100 ns clock | 10.2986 ns | 29.9661 ns |
 | Derived pre-layout Fmax | 11.148 MHz | 14.279 MHz |
 
-The area fell by about 0.7%, while the estimated Fmax fell by about 22%. The result confirms memory inference, but it does not demonstrate the timing benefit of a physical SRAM macro. A macro-level result needs a matching macro Liberty/LEF and a memory compiler.
+The area fell by about 0.7%, while the estimated Fmax fell by about 22%. The standard-cell fallback confirms abstract memory inference, but the wide RTL read mux remains in the mapped logic. The SRAM22 path below uses hard macros to remove that array mux from the standard-cell datapath.
+
+## SRAM22 macro path
+
+The Sky130 flow generates a `64×128` payload macro and a `64×8` tag macro for each logical memory. The 16 architectural addresses use the first 16 rows; the extra depth is the smallest SRAM22 timing configuration. The valid bitmap remains in standard cells so reset does not clear the physical SRAM. This gives four hard macros per PE: two for the register file and two for local SRAM.
+
+SRAM22 emits Verilog, Liberty, LEF, GDS, and SPICE views. The timing libraries for this custom size use the generator's interpolated characterization; this run is pre-layout and does not run DRC/LVS or route the macros. Treat the macro timing as an integration estimate until physical verification is added.
 
 ## Timing and area interpretation
 
@@ -55,4 +61,4 @@ The flow pins the Sky130HD timing Liberty to PDK repository commit `5a42fd01a0ee
 
 ## Architectural implications
 
-The current RTL describes each register file and local SRAM as a 16×132 single-port synchronous memory and separates operand reads, execution, and writeback. The Sky130HD flow verifies that both memories are inferred, then maps them to standard cells because no SRAM macro model is supplied. The post-change estimate is 780,806.36 µm² and 11.148 MHz for one PE; timing is lower than the previous baseline and needs a later optimization pass.
+The current RTL separates operand reads, execution, and writeback. The Sky130HD flow measures both the standard-cell fallback and the optional SRAM22 macro implementation for one PE. The macro run includes macro area from LEF and macro timing from Liberty; neither run includes placement or routing.
