@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run a small, technology-independent Yosys baseline for Grider tiles."""
+"""Report a technology-independent Yosys coarse-synthesis baseline."""
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -28,7 +29,7 @@ def run_config(name: str, width: int, height: int) -> dict[str, object]:
     out = OUT / name
     out.mkdir(parents=True, exist_ok=True)
     premap = out / "premap.json"
-    mapped = out / "generic.json"
+    coarse = out / "coarse.json"
     log_path = out / "yosys.log"
     commands = f"""
 read_verilog -sv {RTL}
@@ -39,8 +40,8 @@ opt
 memory_dff
 memory_collect
 tee -o {premap} stat -json
-synth -top grider_tile -flatten
-tee -o {mapped} stat -json
+synth -top grider_tile -flatten -run begin:coarse
+tee -o {coarse} stat -json
 """
     with log_path.open("w") as log:
         result = subprocess.run(
@@ -49,19 +50,20 @@ tee -o {mapped} stat -json
             stdout=log,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=600,
+            timeout=300,
         )
     if result.returncode:
         tail = log_path.read_text(errors="replace").splitlines()[-80:]
         raise RuntimeError(f"Yosys failed for {name}:\n" + "\n".join(tail))
 
     premap_counts = read_cell_counts(premap)
-    generic_counts = read_cell_counts(mapped)
+    coarse_counts = read_cell_counts(coarse)
     memory_count = sum(
         count for cell, count in premap_counts.items() if "mem" in cell.lower()
     )
-    ff_count = sum(
-        count for cell, count in generic_counts.items() if "dff" in cell.lower()
+    multiplier_count = sum(
+        count for cell, count in coarse_counts.items()
+        if "mul" in cell.lower() or "macc" in cell.lower()
     )
     return {
         "configuration": name,
@@ -70,10 +72,10 @@ tee -o {mapped} stat -json
         "lanes": lanes,
         "architectural_state_bits": lanes * (16 + 16) * 132,
         "premap_memory_cells": memory_count,
-        "generic_cell_count": sum(generic_counts.values()),
-        "generic_flip_flop_cells": ff_count,
+        "coarse_cell_count": sum(coarse_counts.values()),
+        "coarse_multiplier_cells": multiplier_count,
         "premap_cell_types": premap_counts,
-        "generic_cell_types": generic_counts,
+        "coarse_cell_types": coarse_counts,
     }
 
 
@@ -85,34 +87,33 @@ def main() -> int:
     (OUT / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
 
     lines = [
-        "# Grider generic synthesis baseline",
+        "# Grider Yosys coarse-synthesis baseline",
         "",
         f"Tool: {version}",
         "",
-        "| Configuration | Lanes | Architectural state bits | Premap memory cells | Generic cells | Generic FF cells |",
+        "| Configuration | Lanes | State bits | Premap memory cells | Coarse cells | Multiplier/MACC cells |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for item in results:
         lines.append(
             "| {configuration} | {lanes} | {architectural_state_bits:,} | "
-            "{premap_memory_cells:,} | {generic_cell_count:,} | "
-            "{generic_flip_flop_cells:,} |".format(**item)
+            "{premap_memory_cells:,} | {coarse_cell_count:,} | "
+            "{coarse_multiplier_cells:,} |".format(**item)
         )
     lines.extend(
         [
             "",
-            "The generic cell count is a technology-independent logic-size proxy, not physical area in mm².",
-            "The premap memory-cell count comes from Yosys before memory mapping.",
-            "Fmax is not reported: the repository does not select a target device or standard-cell library, "
+            "Coarse Yosys cell counts are structural metrics, not physical area.",
+            "Fmax is not reported because this repository does not select a target device or cell library "
             "and has no clock or I/O timing constraints.",
             "",
         ]
     )
     summary = "\n".join(lines)
     (OUT / "summary.md").write_text(summary)
-    github_summary = Path(__import__("os").environ.get("GITHUB_STEP_SUMMARY", ""))
-    if str(github_summary):
-        with github_summary.open("a") as stream:
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        with Path(summary_path).open("a") as stream:
             stream.write(summary)
     print(summary)
     return 0
