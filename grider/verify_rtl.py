@@ -92,6 +92,13 @@ def _stimulus(tile: Tile, integer_program: list[Instruction],
 
 def _program() -> list[Instruction]:
     mask = sum(1 << lane for lane in range(LANES) if lane % 3 == 1)
+    reduction_mask = 0
+    for lane in range(LANES):
+        row, col = divmod(lane, 16)
+        if (row % 4 == 0 and col in (1, 4, 7, 10, 13)) or \
+           (row % 4 == 1 and col == 7) or \
+           (row % 4 == 3 and col % 2 == 0):
+            reduction_mask |= 1 << lane
     return [
         Instruction(Opcode.ADD, dst=4, src_a=0, src_b=1, dtype=DataType.I8),
         Instruction(Opcode.MAC, dst=2, src_a=0, src_b=1, dtype=DataType.I8),
@@ -109,6 +116,12 @@ def _program() -> list[Instruction]:
                     lane_mask=mask),
         Instruction(Opcode.SEL, dst=15, src_a=3, src_b=0, src_c=1,
                     dtype=DataType.I8),
+        Instruction(Opcode.REDUCE_SUM, dst=4, src_a=0, dtype=DataType.I8),
+        Instruction(Opcode.REDUCE_MAX, dst=5, src_a=0, dtype=DataType.I8),
+        Instruction(Opcode.REDUCE_SUM, dst=6, src_a=1, dtype=DataType.I8,
+                    lane_mask=reduction_mask),
+        Instruction(Opcode.REDUCE_MAX, dst=7, src_a=0, dtype=DataType.I8,
+                    lane_mask=reduction_mask),
         Instruction(Opcode.MOVI, dst=1, imm=0x80, dtype=DataType.I8),
     ]
 
@@ -121,6 +134,8 @@ def _bf16_program() -> list[Instruction]:
         Instruction(Opcode.MAC, dst=4, src_a=0, src_b=1, dtype=DataType.BF16),
         Instruction(Opcode.MIN, dst=8, src_a=0, src_b=1, dtype=DataType.BF16),
         Instruction(Opcode.MAX, dst=9, src_a=0, src_b=1, dtype=DataType.BF16),
+        Instruction(Opcode.REDUCE_SUM, dst=10, src_a=0, dtype=DataType.BF16),
+        Instruction(Opcode.REDUCE_MAX, dst=11, src_a=1, dtype=DataType.BF16),
     ]
 
 

@@ -75,6 +75,8 @@ module grider_tile #(
     localparam logic [4:0] OP_NEIGHBOR = 5'd15;
     localparam logic [4:0] OP_LOAD     = 5'd16;
     localparam logic [4:0] OP_STORE    = 5'd17;
+    localparam logic [4:0] OP_REDUCE_SUM = 5'd18;
+    localparam logic [4:0] OP_REDUCE_MAX = 5'd19;
 
     localparam logic [3:0] DT_I4 = 4'h0;
     localparam logic [3:0] DT_I8 = 4'h1;
@@ -103,7 +105,8 @@ module grider_tile #(
     );
         begin
             case (operation)
-                OP_ADD, OP_SUB, OP_MUL, OP_MAC, OP_MIN, OP_MAX:
+                OP_ADD, OP_SUB, OP_MUL, OP_MAC, OP_MIN, OP_MAX,
+                OP_REDUCE_SUM, OP_REDUCE_MAX:
                     opcode_supports_dtype =
                         (tag == DT_I4) || (tag == DT_I8) || (tag == DT_BF16) ||
                         (tag == DT_I16) || (tag == DT_I32) || (tag == DT_I64);
@@ -126,6 +129,8 @@ module grider_tile #(
     logic [127:0] lane_c [0:LANES-1];
     logic [127:0] lane_acc [0:LANES-1];
     logic [3:0]   lane_dtype [0:LANES-1];
+    logic [127:0] row_reduction [0:TILE_H-1];
+    logic [3:0]   row_reduction_type [0:TILE_H-1];
     logic signed [127:0] signed_a;
     logic signed [127:0] signed_b;
     logic signed [127:0] signed_min_a;
@@ -136,6 +141,9 @@ module grider_tile #(
     integer nx;
     integer ny;
     integer neighbor;
+    integer reduction_row;
+    integer reduction_col;
+    logic reduction_row_has_lane;
 
     // A host write takes the tile's state port for this cycle.
     assign instruction_ready = rst_n && !host_write_enable;
@@ -432,6 +440,131 @@ module grider_tile #(
         end
     endfunction
 
+    function automatic logic [127:0] reduce_row_sum(
+        input integer row_index,
+        input logic [3:0] register_index,
+        input logic [3:0] value_type
+    );
+        logic [127:0] partial [0:TILE_W-1];
+        logic [TILE_W-1:0] valid_lane;
+        logic [127:0] sum_value;
+        logic has_nan;
+        integer col;
+        integer stride;
+        integer start_col;
+        begin
+            has_nan = 1'b0;
+            for (col = 0; col < TILE_W; col = col + 1) begin
+                partial[col] = rf_data[row_index*TILE_W+col][register_index];
+                valid_lane[col] = lane_mask[row_index*TILE_W+col];
+                if ((value_type == DT_BF16) && valid_lane[col] &&
+                    (partial[col][14:7] == 8'hff) && (partial[col][6:0] != 0))
+                    has_nan = 1'b1;
+            end
+            stride = 1;
+            while (stride < TILE_W) begin
+                for (start_col = 0; start_col < TILE_W; start_col = start_col + 2*stride) begin
+                    if ((start_col + stride < TILE_W) && valid_lane[start_col] && valid_lane[start_col+stride]) begin
+                        if (value_type == DT_BF16) begin
+                            partial[start_col] = {112'b0,
+                                bf16_add(partial[start_col][15:0], partial[start_col+stride][15:0])};
+                        end else begin
+                            sum_value = $signed(sign_extend_by_type(partial[start_col], value_type)) +
+                                        $signed(sign_extend_by_type(partial[start_col+stride], value_type));
+                            partial[start_col] = truncate_by_type(sum_value, value_type);
+                        end
+                    end else if ((start_col + stride < TILE_W) && !valid_lane[start_col] && valid_lane[start_col+stride]) begin
+                        partial[start_col] = partial[start_col+stride];
+                        valid_lane[start_col] = 1'b1;
+                    end
+                end
+                stride = stride * 2;
+            end
+            if (has_nan && (value_type == DT_BF16))
+                reduce_row_sum = {112'b0, 16'h7fc0};
+            else
+                reduce_row_sum = valid_lane[0] ? truncate_by_type(partial[0], value_type) : '0;
+        end
+    endfunction
+
+    function automatic logic [127:0] reduce_row_max(
+        input integer row_index,
+        input logic [3:0] register_index,
+        input logic [3:0] value_type
+    );
+        logic [127:0] partial [0:TILE_W-1];
+        logic [TILE_W-1:0] valid_lane;
+        logic signed [127:0] left_value;
+        logic signed [127:0] right_value;
+        logic has_nan;
+        integer col;
+        integer stride;
+        integer start_col;
+        begin
+            has_nan = 1'b0;
+            for (col = 0; col < TILE_W; col = col + 1) begin
+                partial[col] = rf_data[row_index*TILE_W+col][register_index];
+                valid_lane[col] = lane_mask[row_index*TILE_W+col];
+                if ((value_type == DT_BF16) && valid_lane[col] &&
+                    (partial[col][14:7] == 8'hff) && (partial[col][6:0] != 0))
+                    has_nan = 1'b1;
+            end
+            stride = 1;
+            while (stride < TILE_W) begin
+                for (start_col = 0; start_col < TILE_W; start_col = start_col + 2*stride) begin
+                    if ((start_col + stride < TILE_W) && valid_lane[start_col] && valid_lane[start_col+stride]) begin
+                        if (value_type == DT_BF16) begin
+                            if (((partial[start_col][14:7] == 8'hff) && (partial[start_col][6:0] != 0)) ||
+                                ((partial[start_col+stride][14:7] == 8'hff) && (partial[start_col+stride][6:0] != 0))) begin
+                                partial[start_col] = {112'b0, 16'h7fc0};
+                                has_nan = 1'b1;
+                            end else if (bf16_less_than(partial[start_col][15:0], partial[start_col+stride][15:0])) begin
+                                partial[start_col] = partial[start_col+stride];
+                            end
+                        end else begin
+                            left_value = $signed(sign_extend_by_type(partial[start_col], value_type));
+                            right_value = $signed(sign_extend_by_type(partial[start_col+stride], value_type));
+                            if (right_value > left_value) partial[start_col] = partial[start_col+stride];
+                        end
+                    end else if ((start_col + stride < TILE_W) && !valid_lane[start_col] && valid_lane[start_col+stride]) begin
+                        partial[start_col] = partial[start_col+stride];
+                        valid_lane[start_col] = 1'b1;
+                    end
+                end
+                stride = stride * 2;
+            end
+            if (has_nan && (value_type == DT_BF16))
+                reduce_row_max = {112'b0, 16'h7fc0};
+            else
+                reduce_row_max = valid_lane[0] ? truncate_by_type(partial[0], value_type) : '0;
+        end
+    endfunction
+
+    integer reduce_y;
+    integer reduce_x;
+    logic found_active_lane;
+    always_comb begin
+        for (reduce_y = 0; reduce_y < TILE_H; reduce_y = reduce_y + 1) begin
+            row_reduction[reduce_y] = '0;
+            row_reduction_type[reduce_y] = DT_I32;
+            found_active_lane = 1'b0;
+            for (reduce_x = 0; reduce_x < TILE_W; reduce_x = reduce_x + 1) begin
+                if (!found_active_lane && lane_mask[reduce_y*TILE_W+reduce_x]) begin
+                    row_reduction_type[reduce_y] = (dtype == DT_INHERIT) ?
+                        rf_type[reduce_y*TILE_W+reduce_x][src_a] : dtype;
+                    found_active_lane = 1'b1;
+                end
+            end
+            if (found_active_lane && dtype_is_valid(row_reduction_type[reduce_y]) &&
+                opcode_supports_dtype(opcode, row_reduction_type[reduce_y])) begin
+                if (opcode == OP_REDUCE_SUM)
+                    row_reduction[reduce_y] = reduce_row_sum(reduce_y, src_a, row_reduction_type[reduce_y]);
+                else if (opcode == OP_REDUCE_MAX)
+                    row_reduction[reduce_y] = reduce_row_max(reduce_y, src_a, row_reduction_type[reduce_y]);
+            end
+        end
+    end
+
     always_comb begin
         for (lane = 0; lane < LANES; lane = lane + 1) begin
             lane_result[lane] = '0;
@@ -444,6 +577,8 @@ module grider_tile #(
             lane_acc[lane] = rf_data[lane][dst];
             if (opcode == OP_SEL) begin
                 lane_dtype[lane] = (dtype == DT_INHERIT) ? rf_type[lane][src_b] : dtype;
+            end else if ((opcode == OP_REDUCE_SUM) || (opcode == OP_REDUCE_MAX)) begin
+                lane_dtype[lane] = row_reduction_type[lane / TILE_W];
             end else if (opcode == OP_LOAD) begin
                 lane_dtype[lane] = sram_type[lane][immediate[3:0]];
             end else if ((opcode == OP_MOV) || (opcode == OP_NEIGHBOR) || (opcode == OP_STORE)) begin
@@ -591,6 +726,11 @@ module grider_tile #(
                         lane_result[lane] = lane_a[lane];
                         lane_result_type[lane] = rf_type[lane][src_a];
                     end
+                    OP_REDUCE_SUM, OP_REDUCE_MAX: begin
+                        lane_result[lane] = row_reduction[lane / TILE_W];
+                        lane_result_type[lane] = row_reduction_type[lane / TILE_W];
+                        lane_write[lane] = 1'b1;
+                    end
                     default: begin end
                 endcase
             end
@@ -644,3 +784,4 @@ module grider_tile #(
     end
 
 endmodule
+
