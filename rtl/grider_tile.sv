@@ -234,8 +234,10 @@ module grider_tile #(
                 shifted = value;
             end else begin
                 shifted = value >> amount;
-                for (bit_index = 0; bit_index < amount; bit_index = bit_index + 1)
-                    discarded = discarded | value[bit_index];
+                for (bit_index = 0; bit_index < 12; bit_index = bit_index + 1) begin
+                    if (bit_index < amount)
+                        discarded = discarded | value[bit_index];
+                end
                 shifted[0] = shifted[0] | discarded;
             end
             bf16_shift_right_sticky = shifted;
@@ -305,7 +307,6 @@ module grider_tile #(
         logic [12:0] sum_ext;
         logic [15:0] a_abs;
         logic [15:0] b_abs;
-        logic discarded;
         begin
             sign_a = a_value[15]; sign_b = b_value[15];
             exp_a = (a_value[14:7] == 0) ? 1 : a_value[14:7];
@@ -334,16 +335,7 @@ module grider_tile #(
                     large_ext = ext_b; small_ext = ext_a; exponent = exp_b; sign_result = sign_b;
                     difference = exp_b - exp_a;
                 end
-                aligned_small = '0;
-                discarded = 1'b0;
-                if (difference >= 12) begin
-                    aligned_small[0] = |small_ext;
-                end else begin
-                    aligned_small = small_ext >> difference;
-                    for (shift_index = 0; shift_index < difference; shift_index = shift_index + 1)
-                        discarded = discarded | small_ext[shift_index];
-                    aligned_small[0] = aligned_small[0] | discarded;
-                end
+                aligned_small = bf16_shift_right_sticky(small_ext, difference);
                 if (sign_a == sign_b) begin
                     sum_ext = {1'b0, large_ext} + {1'b0, aligned_small};
                     if (sum_ext[12]) begin
@@ -359,9 +351,11 @@ module grider_tile #(
                         sign_result = 1'b0;
                         exponent = 0;
                     end else begin
-                        while (!work_ext[11] && (exponent > 1)) begin
-                            work_ext = work_ext << 1;
-                            exponent = exponent - 1;
+                        for (shift_index = 0; shift_index < 11; shift_index = shift_index + 1) begin
+                            if (!work_ext[11] && (exponent > 1)) begin
+                                work_ext = work_ext << 1;
+                                exponent = exponent - 1;
+                            end
                         end
                     end
                 end
@@ -377,6 +371,7 @@ module grider_tile #(
         integer exp_a;
         integer exp_b;
         integer exponent;
+        integer normalize_step;
         logic sign_result;
         logic [7:0] sig_a;
         logic [7:0] sig_b;
@@ -388,8 +383,10 @@ module grider_tile #(
             exp_b = (b_value[14:7] == 0) ? 1 : b_value[14:7];
             sig_a = (a_value[14:7] == 0) ? {1'b0, a_value[6:0]} : {1'b1, a_value[6:0]};
             sig_b = (b_value[14:7] == 0) ? {1'b0, b_value[6:0]} : {1'b1, b_value[6:0]};
-            while ((sig_a != 0) && !sig_a[7]) begin sig_a = sig_a << 1; exp_a = exp_a - 1; end
-            while ((sig_b != 0) && !sig_b[7]) begin sig_b = sig_b << 1; exp_b = exp_b - 1; end
+            for (normalize_step = 0; normalize_step < 7; normalize_step = normalize_step + 1) begin
+                if ((sig_a != 0) && !sig_a[7]) begin sig_a = sig_a << 1; exp_a = exp_a - 1; end
+                if ((sig_b != 0) && !sig_b[7]) begin sig_b = sig_b << 1; exp_b = exp_b - 1; end
+            end
             product = sig_a * sig_b;
             if ((a_value[14:7] == 8'hff && a_value[6:0] != 0) ||
                 (b_value[14:7] == 8'hff && b_value[6:0] != 0)) begin
