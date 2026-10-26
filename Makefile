@@ -1,4 +1,4 @@
-.PHONY: test verify examples
+.PHONY: test verify examples benchmark
 
 test:
 	python -m unittest discover -s tests -v
@@ -14,3 +14,7 @@ examples:
 	python -m grider.examples.layer_norm
 	python -m grider.examples.attention
 	python -m grider.examples.mlp
+
+
+benchmark:
+	python -m grider.benchmark
