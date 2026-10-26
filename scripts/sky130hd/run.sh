@@ -12,8 +12,29 @@ fi
   sta -version
 } > build/sky130hd/tool-versions.txt 2>&1
 
+cat > build/sky130hd/param-check.ys <<'YOSYS'
+read_verilog -defer -sv rtl/grider_tile.sv
+hierarchy -check -chparam TILE_W 1 -chparam TILE_H 1 -chparam LANES 1 -top grider_tile
+write_json build/sky130hd/param-check.json
+YOSYS
+
+yosys -s build/sky130hd/param-check.ys 2>&1 | tee build/sky130hd/param-check.log
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+data = json.loads(Path("build/sky130hd/param-check.json").read_text())
+top = data.get("modules", {}).get("grider_tile")
+if top is None:
+    raise SystemExit("Yosys parameter check did not elaborate grider_tile")
+width = len(top.get("ports", {}).get("lane_mask", {}).get("bits", []))
+if width != 1:
+    raise SystemExit(f"Expected LANES=1 before synthesis, got lane_mask width {width}")
+print("Confirmed one-lane elaboration before synthesis.")
+PY
+
 cat > build/sky130hd/memory.ys <<'YOSYS'
-read_verilog -sv rtl/grider_tile.sv
+read_verilog -defer -sv rtl/grider_tile.sv
 hierarchy -check -chparam TILE_W 1 -chparam TILE_H 1 -chparam LANES 1 -top grider_tile
 proc
 opt
@@ -25,7 +46,7 @@ tee -o build/sky130hd/pre-map-stat.txt stat
 YOSYS
 
 cat > build/sky130hd/map.ys <<'YOSYS'
-read_verilog -sv rtl/grider_tile.sv
+read_verilog -defer -sv rtl/grider_tile.sv
 hierarchy -check -chparam TILE_W 1 -chparam TILE_H 1 -chparam LANES 1 -top grider_tile
 synth -top grider_tile -noabc
 dfflibmap -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
