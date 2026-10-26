@@ -56,6 +56,8 @@ abc -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
 clean
 tee -o build/sky130hd/mapped-stat.txt stat -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
 write_json build/sky130hd/mapped.json
+# Keep RTL port names, but hide complex source-derived internal names before STA export.
+rename -hide
 write_verilog -noattr -noexpr build/sky130hd/grider_tile_mapped.v
 YOSYS
 
