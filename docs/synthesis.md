@@ -77,3 +77,19 @@ The flow pins the Sky130HD timing Liberty to PDK repository commit `5a42fd01a0ee
 ## Architectural implications
 
 The current RTL separates operand reads, execution, and writeback. The Sky130HD flow measures both the standard-cell fallback and the optional SRAM22 macro implementation for one PE. The macro run includes macro area from LEF and macro timing from Liberty; neither run includes placement or routing.
+
+## BF16 microkernel throughput
+
+`rtl/tb_grider_kernel_bench.sv` runs BF16 MOVI, ADD, MUL, and MAC instructions through a one-lane `grider_tile`. Icarus Verilog simulation checks the outputs through the host read port and counts completion cycles. The measured instruction latencies are 4 cycles for ADD/MUL and 5 cycles for MAC. The test executes 16 ADDs, 16 MULs, and 16 MACs; MAC counts as 2 FLOPs (one multiply plus one add).
+
+The Python functional emulator also runs these instruction sequences across all 256 lanes and checks the resulting values. The emulator is not cycle accurate, so its wall-clock time is not used to calculate hardware throughput. The table multiplies the one-lane RTL rate by 256 lanes and assumes the one-PE macro-path Fmax applies to the full tile; this is a projection, not a measured 16×16 tile result.
+
+| BF16 operation | RTL cycles/instruction | 1 lane at 20 MHz | 256 lanes at 20 MHz | 256 lanes at 20.982 MHz* |
+|---|---:|---:|---:|---:|
+| ADD | 4 | 5 MFLOPS | 1.28 GFLOPS | 1.342848 GFLOPS |
+| MUL | 4 | 5 MFLOPS | 1.28 GFLOPS | 1.342848 GFLOPS |
+| MAC | 5 | 8 MFLOPS | 2.048 GFLOPS | 2.148557 GFLOPS |
+
+At 20 MHz, the calculation is `lanes × FLOPs per instruction × clock / cycles per instruction`. Since the RTL does not overlap instructions, these rates include the source-read and writeback cycles. The 20.982 MHz column uses the pre-layout Fmax estimate for one PE from the SRAM22 path above; full-tile timing and throughput remain unmeasured.
+
+Run the functional emulator with `python -m grider.benchmark --clock-mhz 20`. The Sky130HD workflow runs the RTL microbenchmark and uploads its cycle-count log with the other synthesis reports.
