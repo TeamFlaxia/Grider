@@ -7,14 +7,14 @@
 - [x] Attention基本カーネルのPython試作・検証
   - `grider/kernels.py`にscaled dot-product attention、stable softmax、causal maskを実装。
   - `grider/examples/attention.py`と単体テストで実行確認。これはPython参照実装で、命令列へのコンパイルは未対応。
-- [x] ISA v0の確定
+- [x] ISAの確定（v0、Reduction追加時にv0.1へ拡張）
   - opcode、型タグ、予約値、型継承、丸め、近傍方向、ホスト発行規約を`docs/isa.md`に定義。
 - [x] SystemVerilogのセル・タイル機能実装
   - `rtl/grider_tile.sv`に256セルのSIMDタイル、型付きレジスタ/SRAM、ALU/MAC、BF16、近傍ポートを実装。
   - `rtl/grider_mesh.sv`に命令ブロードキャストとタイル間halo接続を実装。Icarus Verilogで機能シミュレーション済み。
 - [x] BF16/INT8演算の実装
   - PythonとRTLに整数演算およびBF16 add/sub/mul/MAC/min/maxを実装。
-  - `grider.verify_rtl`で21命令を実行し、256セルの全レジスタ/SRAM計8,192ワードを比較。一致を確認。
+  - `grider.verify_rtl`で27命令を実行し、256セルの全レジスタ/SRAM計8,192ワードを比較。一致を確認。
 - [x] マルチタイル化（機能プロトタイプ）
   - Python MeshとRTL Meshを実装。2×2構成で8方向haloを比較し、9,216レジスタワードが一致。
 
