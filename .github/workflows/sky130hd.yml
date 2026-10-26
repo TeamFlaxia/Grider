@@ -13,10 +13,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: YosysHQ/setup-oss-cad-suite@v4
-      - name: Install OpenSTA
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y opensta
+      - name: Pull OpenROAD Flow container
+        run: docker pull openroad/orfs:latest
       - name: Fetch pinned Sky130HD timing library
         env:
           PDK_COMMIT: 5a42fd01a0eeb2338340438443c7062e198d97a4
@@ -37,8 +35,11 @@ jobs:
             build/sky130hd/report.md
             build/sky130hd/tool-versions.txt
             build/sky130hd/param-check.log
+            build/sky130hd/pre-map.json
             build/sky130hd/pre-map-stat.txt
+            build/sky130hd/mapped.json
             build/sky130hd/mapped-stat.txt
+            build/sky130hd/grider_tile_mapped.v
             build/sky130hd/memory.log
             build/sky130hd/yosys.log
             build/sky130hd/sta.log

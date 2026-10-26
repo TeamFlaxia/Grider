@@ -9,7 +9,8 @@ fi
 
 {
   yosys -V
-  sta -version
+  docker run --rm openroad/orfs:latest bash -lc \
+    'source /OpenROAD-flow-scripts/env.sh && openroad -version'
 } > build/sky130hd/tool-versions.txt 2>&1
 
 cat > build/sky130hd/param-check.ys <<'YOSYS'
@@ -60,6 +61,12 @@ YOSYS
 
 yosys -s build/sky130hd/memory.ys 2>&1 | tee build/sky130hd/memory.log
 yosys -s build/sky130hd/map.ys 2>&1 | tee build/sky130hd/yosys.log
-sta -exit scripts/sky130hd/sta.tcl 2>&1 | tee build/sky130hd/sta.log
+docker run --rm \
+  -v "$PWD:/work" \
+  -w /work \
+  -e SKY130HD_LIB="$SKY130HD_LIB" \
+  openroad/orfs:latest \
+  bash -lc 'source /OpenROAD-flow-scripts/env.sh && openroad -exit scripts/sky130hd/sta.tcl' \
+  2>&1 | tee build/sky130hd/sta.log
 python3 scripts/sky130hd/summarize.py
 cat build/sky130hd/report.md >> "$GITHUB_STEP_SUMMARY"
