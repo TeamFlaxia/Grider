@@ -673,8 +673,31 @@ module grider_tile #(
         end
     endfunction
 
-    // Synthesis-friendly inline reduction tree over the latched source values.
+    // Reduction inputs come from the latched source snapshot. Skip the tree
+    // unless a reduction is executing; host traffic and ordinary instructions
+    // do not need to scan every row.
     always_comb begin
+        for (reduce_y = 0; reduce_y < TILE_H; reduce_y = reduce_y + 1) begin
+            row_reduction[reduce_y] = '0;
+            row_reduction_type[reduce_y] = DT_I32;
+        end
+        for (reduce_x = 0; reduce_x < TILE_W; reduce_x = reduce_x + 1) begin
+            reduce_partial[reduce_x] = '0;
+            reduce_valid[reduce_x] = 1'b0;
+        end
+        found_active_lane = 1'b0;
+        reduce_type_work = DT_I32;
+        reduce_stage = 0;
+        reduce_stride = 1;
+        reduce_col = 0;
+        reduce_has_nan = 1'b0;
+        reduce_sum_value = '0;
+        reduce_left_value = '0;
+        reduce_right_value = '0;
+
+        if ((state == ST_EXEC) &&
+            ((instruction_opcode_q == OP_REDUCE_SUM) ||
+             (instruction_opcode_q == OP_REDUCE_MAX))) begin
         for (reduce_y = 0; reduce_y < TILE_H; reduce_y = reduce_y + 1) begin
             row_reduction[reduce_y] = '0;
             row_reduction_type[reduce_y] = DT_I32;
@@ -687,6 +710,7 @@ module grider_tile #(
             reduce_sum_value = '0;
             reduce_left_value = '0;
             reduce_right_value = '0;
+
             for (reduce_x = 0; reduce_x < TILE_W; reduce_x = reduce_x + 1) begin
                 reduce_partial[reduce_x] = '0;
                 reduce_valid[reduce_x] = 1'b0;
@@ -767,6 +791,7 @@ module grider_tile #(
                             truncate_by_type(reduce_partial[0], reduce_type_work);
                 end
             end
+        end
         end
     end
 
