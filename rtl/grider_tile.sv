@@ -680,6 +680,9 @@ module grider_tile #(
             row_reduction_type[reduce_y] = DT_I32;
             found_active_lane = 1'b0;
             reduce_type_work = DT_I32;
+            reduce_stage = 0;
+            reduce_stride = 1;
+            reduce_col = 0;
             reduce_has_nan = 1'b0;
             reduce_sum_value = '0;
             reduce_left_value = '0;
