@@ -1,0 +1,3 @@
+# Sum each row independently. Inputs: r0. Output is broadcast to active r2 cells.
+.dtype i32
+reduce_sum r2, r0

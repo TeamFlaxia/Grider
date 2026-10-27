@@ -1,12 +1,16 @@
 # Grider TODO
 
-最終更新: 2026-10-26
+最終更新: 2026-10-27
 
 ## 完了
 
 - [x] Attention基本カーネルのPython試作・検証
   - `grider/kernels.py`にscaled dot-product attention、stable softmax、causal maskを実装。
-  - `grider/examples/attention.py`と単体テストで実行確認。これはPython参照実装で、命令列へのコンパイルは未対応。
+  - `grider/examples/attention.py`と単体テストで実行確認。これはPython参照実装で、Grider命令列へのloweringは未対応。
+- [x] ホスト側アセンブラと命令カーネルの最初の縦切り
+  - `.dtype`、`.mask`、安全な整数式、`.repeat`を扱う`.gr`アセンブラを追加。
+  - BF16 vector add、INT32 row sum、16×16 BF16 GEMMをTileエミュレータ上で実行。
+  - アセンブラとカーネル配置を`docs/programming.md`に記載。RTLの命令フェッチ機能はまだない。
 - [x] ISAの確定（v0、Reduction追加時にv0.1へ拡張）
   - opcode、型タグ、予約値、型継承、丸め、近傍方向、ホスト発行規約を`docs/isa.md`に定義。
 - [x] SystemVerilogのセル・タイル機能実装
@@ -40,4 +44,5 @@
 ## 次の実装項目
 
 対象FPGAが決まるまでは、Reduction treeの境界ケースと整数overflowを拡充し、合成可能性・面積の見積もり方法を整える。
+
 

@@ -371,7 +371,12 @@ class Tile:
                 # Unknown v0 opcodes are defined as no-ops above.
                 continue
 
-            payload = float_to_bf16(float(result)) if out_type == DataType.BF16 else _pack(int(result), out_type)
+            if out_type == DataType.BF16 and op not in {
+                Opcode.AND, Opcode.OR, Opcode.XOR, Opcode.SHL, Opcode.SHR,
+            }:
+                payload = float_to_bf16(float(result))
+            else:
+                payload = _pack(int(result), out_type)
             writes.append((lane, _Register(payload, out_type)))
 
         for lane, value in writes:
@@ -471,4 +476,5 @@ def gemm16(a: Sequence[Sequence[int | float]], b: Sequence[Sequence[int | float]
             output_row.append(bf16_to_float(float_to_bf16(float(acc))) if dtype == DataType.BF16 else _signed(int(acc), 32))
         result.append(output_row)
     return result
+
 
