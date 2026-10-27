@@ -182,6 +182,8 @@ module grider_tile #(
         end
     endfunction
 
+    localparam integer REDUCE_STAGES = (TILE_W > 1) ? $clog2(TILE_W) : 1;
+
     localparam logic [2:0] ST_IDLE      = 3'd0;
     localparam logic [2:0] ST_WAIT_A    = 3'd1;
     localparam logic [2:0] ST_WAIT_B    = 3'd2;
@@ -250,7 +252,17 @@ module grider_tile #(
     integer i;
     integer reduce_y;
     integer reduce_x;
+    integer reduce_stage;
+    integer reduce_stride;
+    integer reduce_col;
     logic found_active_lane;
+    logic [127:0] reduce_partial [0:TILE_W-1];
+    logic [TILE_W-1:0] reduce_valid;
+    logic [3:0] reduce_type_work;
+    logic reduce_has_nan;
+    logic [127:0] reduce_sum_value;
+    logic signed [127:0] reduce_left_value;
+    logic signed [127:0] reduce_right_value;
 
 
     // A host transaction uses a memory port only while the instruction engine is idle.
@@ -661,124 +673,96 @@ module grider_tile #(
         end
     endfunction
 
-    // Reduce the latched source values. The instruction mask and operand
-    // register were captured before execution, so all rows use one snapshot.
-    function automatic logic [127:0] reduce_row_sum(
-        input integer row_index,
-        input logic [3:0] value_type
-    );
-        logic [127:0] partial [0:TILE_W-1];
-        logic [TILE_W-1:0] valid_lane;
-        logic [127:0] sum_value;
-        logic has_nan;
-        integer col;
-        integer stride;
-        integer start_col;
-        begin
-            has_nan = 1'b0;
-            for (col = 0; col < TILE_W; col = col + 1) begin
-                partial[col] = operand_a[row_index*TILE_W+col][127:0];
-                valid_lane[col] = instruction_lane_mask_q[row_index*TILE_W+col];
-                if ((value_type == DT_BF16) && valid_lane[col] &&
-                    (partial[col][14:7] == 8'hff) && (partial[col][6:0] != 0))
-                    has_nan = 1'b1;
-            end
-            stride = 1;
-            while (stride < TILE_W) begin
-                for (start_col = 0; start_col < TILE_W; start_col = start_col + 2*stride) begin
-                    if ((start_col + stride < TILE_W) && valid_lane[start_col] && valid_lane[start_col+stride]) begin
-                        if (value_type == DT_BF16) begin
-                            partial[start_col] = {112'b0,
-                                bf16_add(partial[start_col][15:0], partial[start_col+stride][15:0])};
-                        end else begin
-                            sum_value = $signed(sign_extend_by_type(partial[start_col], value_type)) +
-                                        $signed(sign_extend_by_type(partial[start_col+stride], value_type));
-                            partial[start_col] = truncate_by_type(sum_value, value_type);
-                        end
-                    end else if ((start_col + stride < TILE_W) && !valid_lane[start_col] && valid_lane[start_col+stride]) begin
-                        partial[start_col] = partial[start_col+stride];
-                        valid_lane[start_col] = 1'b1;
-                    end
-                end
-                stride = stride * 2;
-            end
-            if (has_nan && (value_type == DT_BF16))
-                reduce_row_sum = {112'b0, 16'h7fc0};
-            else
-                reduce_row_sum = valid_lane[0] ? truncate_by_type(partial[0], value_type) : '0;
-        end
-    endfunction
-
-    function automatic logic [127:0] reduce_row_max(
-        input integer row_index,
-        input logic [3:0] value_type
-    );
-        logic [127:0] partial [0:TILE_W-1];
-        logic [TILE_W-1:0] valid_lane;
-        logic signed [127:0] left_value;
-        logic signed [127:0] right_value;
-        logic has_nan;
-        integer col;
-        integer stride;
-        integer start_col;
-        begin
-            has_nan = 1'b0;
-            for (col = 0; col < TILE_W; col = col + 1) begin
-                partial[col] = operand_a[row_index*TILE_W+col][127:0];
-                valid_lane[col] = instruction_lane_mask_q[row_index*TILE_W+col];
-                if ((value_type == DT_BF16) && valid_lane[col] &&
-                    (partial[col][14:7] == 8'hff) && (partial[col][6:0] != 0))
-                    has_nan = 1'b1;
-            end
-            stride = 1;
-            while (stride < TILE_W) begin
-                for (start_col = 0; start_col < TILE_W; start_col = start_col + 2*stride) begin
-                    if ((start_col + stride < TILE_W) && valid_lane[start_col] && valid_lane[start_col+stride]) begin
-                        if (value_type == DT_BF16) begin
-                            if (((partial[start_col][14:7] == 8'hff) && (partial[start_col][6:0] != 0)) ||
-                                ((partial[start_col+stride][14:7] == 8'hff) && (partial[start_col+stride][6:0] != 0))) begin
-                                partial[start_col] = {112'b0, 16'h7fc0};
-                                has_nan = 1'b1;
-                            end else if (bf16_less_than(partial[start_col][15:0], partial[start_col+stride][15:0])) begin
-                                partial[start_col] = partial[start_col+stride];
-                            end
-                        end else begin
-                            left_value = $signed(sign_extend_by_type(partial[start_col], value_type));
-                            right_value = $signed(sign_extend_by_type(partial[start_col+stride], value_type));
-                            if (right_value > left_value) partial[start_col] = partial[start_col+stride];
-                        end
-                    end else if ((start_col + stride < TILE_W) && !valid_lane[start_col] && valid_lane[start_col+stride]) begin
-                        partial[start_col] = partial[start_col+stride];
-                        valid_lane[start_col] = 1'b1;
-                    end
-                end
-                stride = stride * 2;
-            end
-            if (has_nan && (value_type == DT_BF16))
-                reduce_row_max = {112'b0, 16'h7fc0};
-            else
-                reduce_row_max = valid_lane[0] ? truncate_by_type(partial[0], value_type) : '0;
-        end
-    endfunction
-
+    // Synthesis-friendly inline reduction tree over the latched source values.
     always_comb begin
         for (reduce_y = 0; reduce_y < TILE_H; reduce_y = reduce_y + 1) begin
             row_reduction[reduce_y] = '0;
             row_reduction_type[reduce_y] = DT_I32;
             found_active_lane = 1'b0;
+            reduce_type_work = DT_I32;
+            reduce_has_nan = 1'b0;
+            reduce_sum_value = '0;
+            reduce_left_value = '0;
+            reduce_right_value = '0;
             for (reduce_x = 0; reduce_x < TILE_W; reduce_x = reduce_x + 1) begin
+                reduce_partial[reduce_x] = '0;
+                reduce_valid[reduce_x] = 1'b0;
                 if (!found_active_lane && instruction_lane_mask_q[reduce_y*TILE_W+reduce_x]) begin
                     row_reduction_type[reduce_y] = (instruction_dtype_q == DT_INHERIT) ?
                         operand_a[reduce_y*TILE_W+reduce_x][131:128] : instruction_dtype_q;
                     found_active_lane = 1'b1;
                 end
             end
+
             if (found_active_lane && dtype_is_valid(row_reduction_type[reduce_y]) &&
                 opcode_supports_dtype(instruction_opcode_q, row_reduction_type[reduce_y])) begin
-                if (instruction_opcode_q == OP_REDUCE_SUM)
-                    row_reduction[reduce_y] = reduce_row_sum(reduce_y, row_reduction_type[reduce_y]);
-                else if (instruction_opcode_q == OP_REDUCE_MAX)
-                    row_reduction[reduce_y] = reduce_row_max(reduce_y, row_reduction_type[reduce_y]);
+                reduce_type_work = row_reduction_type[reduce_y];
+                for (reduce_x = 0; reduce_x < TILE_W; reduce_x = reduce_x + 1) begin
+                    reduce_partial[reduce_x] = operand_a[reduce_y*TILE_W+reduce_x][127:0];
+                    reduce_valid[reduce_x] = instruction_lane_mask_q[reduce_y*TILE_W+reduce_x];
+                    if ((reduce_type_work == DT_BF16) && reduce_valid[reduce_x] &&
+                        (reduce_partial[reduce_x][14:7] == 8'hff) &&
+                        (reduce_partial[reduce_x][6:0] != 0))
+                        reduce_has_nan = 1'b1;
+                end
+
+                for (reduce_stage = 0; reduce_stage < REDUCE_STAGES; reduce_stage = reduce_stage + 1) begin
+                    reduce_stride = 1 << reduce_stage;
+                    for (reduce_col = 0; reduce_col < TILE_W; reduce_col = reduce_col + 1) begin
+                        if (((reduce_col % (2*reduce_stride)) == 0) &&
+                            (reduce_col + reduce_stride < TILE_W)) begin
+                            if (reduce_valid[reduce_col] && reduce_valid[reduce_col+reduce_stride]) begin
+                                if (instruction_opcode_q == OP_REDUCE_SUM) begin
+                                    if (reduce_type_work == DT_BF16) begin
+                                        reduce_partial[reduce_col] = {112'b0,
+                                            bf16_add(reduce_partial[reduce_col][15:0],
+                                                     reduce_partial[reduce_col+reduce_stride][15:0])};
+                                    end else begin
+                                        reduce_sum_value =
+                                            $signed(sign_extend_by_type(reduce_partial[reduce_col], reduce_type_work)) +
+                                            $signed(sign_extend_by_type(reduce_partial[reduce_col+reduce_stride], reduce_type_work));
+                                        reduce_partial[reduce_col] =
+                                            truncate_by_type(reduce_sum_value, reduce_type_work);
+                                    end
+                                end else if (instruction_opcode_q == OP_REDUCE_MAX) begin
+                                    if (reduce_type_work == DT_BF16) begin
+                                        if (((reduce_partial[reduce_col][14:7] == 8'hff) &&
+                                             (reduce_partial[reduce_col][6:0] != 0)) ||
+                                            ((reduce_partial[reduce_col+reduce_stride][14:7] == 8'hff) &&
+                                             (reduce_partial[reduce_col+reduce_stride][6:0] != 0))) begin
+                                            reduce_partial[reduce_col] = {112'b0, 16'h7fc0};
+                                            reduce_has_nan = 1'b1;
+                                        end else if (bf16_less_than(
+                                            reduce_partial[reduce_col][15:0],
+                                            reduce_partial[reduce_col+reduce_stride][15:0])) begin
+                                            reduce_partial[reduce_col] = reduce_partial[reduce_col+reduce_stride];
+                                        end
+                                    end else begin
+                                        reduce_left_value =
+                                            $signed(sign_extend_by_type(reduce_partial[reduce_col], reduce_type_work));
+                                        reduce_right_value =
+                                            $signed(sign_extend_by_type(reduce_partial[reduce_col+reduce_stride], reduce_type_work));
+                                        if (reduce_right_value > reduce_left_value)
+                                            reduce_partial[reduce_col] = reduce_partial[reduce_col+reduce_stride];
+                                    end
+                                end
+                            end else if (!reduce_valid[reduce_col] &&
+                                         reduce_valid[reduce_col+reduce_stride]) begin
+                                reduce_partial[reduce_col] = reduce_partial[reduce_col+reduce_stride];
+                                reduce_valid[reduce_col] = 1'b1;
+                            end
+                        end
+                    end
+                end
+
+                if ((instruction_opcode_q == OP_REDUCE_SUM) ||
+                    (instruction_opcode_q == OP_REDUCE_MAX)) begin
+                    if (reduce_has_nan && (reduce_type_work == DT_BF16))
+                        row_reduction[reduce_y] = {112'b0, 16'h7fc0};
+                    else if (reduce_valid[0])
+                        row_reduction[reduce_y] =
+                            truncate_by_type(reduce_partial[0], reduce_type_work);
+                end
             end
         end
     end
