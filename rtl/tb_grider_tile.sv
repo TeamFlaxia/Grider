@@ -53,6 +53,30 @@ module tb_grider_tile;
 
     grider_tile dut (.*);
 
+`ifndef GRIDER_USE_SRAM22
+    // Read the inferred arrays directly for the final whole-tile comparison.
+    // Host-port timing is tested above; serially reading 8,192 words would
+    // add thousands of unnecessary clock cycles to the RTL regression.
+    wire [131:0] debug_register_state [0:LANES*16-1];
+    wire [131:0] debug_sram_state [0:LANES*16-1];
+    genvar debug_lane;
+    genvar debug_word;
+    generate
+        for (debug_lane = 0; debug_lane < LANES; debug_lane = debug_lane + 1) begin : debug_lanes
+            for (debug_word = 0; debug_word < 16; debug_word = debug_word + 1) begin : debug_words
+                assign debug_register_state[debug_lane*16+debug_word] =
+                    dut.lane_memories[debug_lane].register_valid[debug_word]
+                        ? dut.lane_memories[debug_lane].register_words[debug_word]
+                        : {4'h4, 128'b0};
+                assign debug_sram_state[debug_lane*16+debug_word] =
+                    dut.lane_memories[debug_lane].local_sram_valid[debug_word]
+                        ? dut.lane_memories[debug_lane].local_sram_words[debug_word]
+                        : {4'h4, 128'b0};
+            end
+        end
+    endgenerate
+`endif
+
     task automatic host_write(input bit is_sram, input integer lane,
                               input integer index, input logic [127:0] data,
                               input logic [3:0] tag);
@@ -207,6 +231,8 @@ module tb_grider_tile;
         // A host write stalls a valid instruction. The same NOP is accepted
         // after the host write releases the state port.
         host_read_word(1'b0, 0, 0, data, tag);
+        if (data !== 128'b0 || tag !== 4'h2)
+            $fatal(1, "host read after BF16 execution returned the wrong register value");
         @(negedge clk);
         host_write_enable = 1'b1; host_read_enable = 1'b0;
         host_memory_select = 1'b0; host_lane = 0; host_index = 0;
@@ -245,12 +271,23 @@ module tb_grider_tile;
 
         for (lane = 0; lane < LANES; lane = lane + 1) begin
             for (r = 0; r < 16; r = r + 1) begin
+`ifdef GRIDER_USE_SRAM22
                 host_read_word(1'b0, lane, r, read_data, read_type);
+`else
+                read_data = debug_register_state[lane*16+r][127:0];
+                read_type = debug_register_state[lane*16+r][131:128];
+`endif
                 $display("R %0d %0d %032h %01h", lane, r, read_data, read_type);
+`ifdef GRIDER_USE_SRAM22
                 host_read_word(1'b1, lane, r, read_data, read_type);
+`else
+                read_data = debug_sram_state[lane*16+r][127:0];
+                read_type = debug_sram_state[lane*16+r][131:128];
+`endif
                 $display("S %0d %0d %032h %01h", lane, r, read_data, read_type);
             end
         end
         $finish;
     end
 endmodule
+
