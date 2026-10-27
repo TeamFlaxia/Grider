@@ -63,4 +63,4 @@ The host repeats each A row across its 16 output columns and each B column acros
 
 ## Host reference kernels
 
-`grider.kernels` also contains higher-precision Python references for dense matrix multiply, stable and causal softmax, layer normalization, scaled dot-product attention, and GELU. The examples under `grider.examples` show these references alongside the instruction-stream vector add and row sum. These reference functions are not assembled Grider programs.
+`grider.kernels` also contains higher-precision Python references for dense matrix multiply, stable and causal softmax, layer normalization, scaled dot-product attention, and GELU. The examples under `grider.examples` show these references alongside the instruction-stream vector add, row sum, and BF16 GEMM. These reference functions are not assembled Grider programs.

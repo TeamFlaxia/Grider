@@ -29,7 +29,7 @@ python -m grider.examples.attention
 python -m grider.examples.mlp
 ```
 
-The vector-add and row-sum examples execute assembled Grider instructions. The matmul, stable and causal softmax, layer normalization, single-head scaled dot-product attention, and two-layer MLP examples use Python reference functions.
+The vector-add, row-sum, and 16×16 BF16 GEMM examples execute assembled Grider instructions. The general matmul, stable and causal softmax, layer normalization, single-head scaled dot-product attention, and two-layer MLP examples use Python reference functions.
 
 Run the 16×16 BF16 instruction kernel from Python with `grider.run_matmul16_bf16(a, b)`, where `a` and `b` are 16×16 matrices. Its host packing and BF16 rounding behavior are documented in [docs/programming.md](docs/programming.md).
 

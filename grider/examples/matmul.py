@@ -1,11 +1,13 @@
-"""Run the host-side FP64 reference matrix multiply."""
+"""Small dense matrix multiplication reference example."""
 from grider.kernels import matmul
 
 
 def main() -> None:
-    a = [[1.0, 2.0], [3.0, 4.0]]
-    b = [[5.0, 6.0], [7.0, 8.0]]
-    print("Reference matmul:", matmul(a, b))
+    a = [[float(r + c) for c in range(4)] for r in range(3)]
+    b = [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [1.0, 1.0]]
+    print("A × B:")
+    for row in matmul(a, b):
+        print(" ".join(f"{value:6.2f}" for value in row))
 
 
 if __name__ == "__main__":

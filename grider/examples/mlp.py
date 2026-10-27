@@ -1,16 +1,17 @@
-"""Run a two-layer host reference MLP with GELU."""
+"""A tiny two-layer MLP forward pass: matmul, bias, GELU, matmul."""
 from grider.kernels import gelu, matmul
 
 
 def main() -> None:
-    x = [[0.5, -1.0], [1.5, 0.25]]
-    w1 = [[1.0, -0.5, 0.25], [0.5, 1.0, -1.0]]
-    b1 = [0.1, 0.2, -0.1]
-    w2 = [[1.0, 0.5], [-0.5, 1.0], [0.25, -1.0]]
-    hidden = matmul(x, w1)
-    hidden = [[value + bias for value, bias in zip(row, b1)] for row in hidden]
-    activated = gelu(hidden)
-    print("Two-layer MLP:", matmul(activated, w2))
+    x = [[0.2, -0.1, 0.5], [1.0, 0.0, -0.5]]
+    w1 = [[0.5, -0.2, 0.1, 0.3], [0.1, 0.4, -0.3, 0.2],
+          [-0.2, 0.1, 0.6, -0.4]]
+    hidden = gelu(matmul(x, w1))
+    w2 = [[0.2, -0.1], [0.4, 0.3], [-0.5, 0.2], [0.1, 0.6]]
+    output = matmul(hidden, w2)
+    print("two-layer MLP output:")
+    for row in output:
+        print(" ".join(f"{value: .5f}" for value in row))
 
 
 if __name__ == "__main__":
