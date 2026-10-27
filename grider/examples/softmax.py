@@ -1,12 +1,11 @@
-"""Stable softmax example, including an optional causal mask."""
-
+"""Run the stable host-side row softmax reference."""
 from grider.kernels import softmax_rows
 
 
 def main() -> None:
-    logits = [[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]]
-    print("softmax:", softmax_rows(logits))
-    print("causal:", softmax_rows(logits, causal=True))
+    values = [[1.0, 2.0, 3.0], [3.0, 1.0, -1.0]]
+    print("Stable softmax:", softmax_rows(values))
+    print("Causal softmax:", softmax_rows(values, causal=True))
 
 
 if __name__ == "__main__":

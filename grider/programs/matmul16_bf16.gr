@@ -1,0 +1,17 @@
+# 16x16 BF16 GEMM over a prepacked host layout.
+# Each output cell (row, column) receives its A row in r0/r1 and B column in r2/r3.
+# Each register stores eight BF16 payloads, least-significant element first.
+.dtype bf16
+movi r7, 0.0
+.repeat 8 as k
+    movi r4, {k} * 16, i32
+    shr r5, r0, r4
+    shr r6, r2, r4
+    mac r7, r5, r6
+.endrepeat
+.repeat 8 as k
+    movi r4, {k} * 16, i32
+    shr r5, r1, r4
+    shr r6, r3, r4
+    mac r7, r5, r6
+.endrepeat

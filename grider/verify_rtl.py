@@ -72,6 +72,7 @@ def _stimulus(tile: Tile, integer_program: list[Instruction],
         1: [0x8000, 0x8000, 0x0001, 0x0001, 0x0080, 0x3f80, 0x3f80, 0x7f7f,
             0x7f7f, 0x3f80, 0xbf80, 0x3f80, 0x007f, 0x0080, 0x0080, 0x4000,
             0x3f80, 0x3f80, 0x0000, 0x7f80, 0xff80, 0x7fc0],
+        2: [0x3f08] * LANES,
         4: [0x8000, 0x0000, 0x0001, 0x007f, 0x0080, 0xbf80, 0x3f80, 0x7f7f,
             0xff7f, 0x3f80, 0x3f80, 0xbf80, 0x0001, 0x807f, 0x0080, 0xc000,
             0x7fc0, 0xff80, 0x7f80, 0xff80, 0x0000, 0x8000],
@@ -136,6 +137,11 @@ def _bf16_program() -> list[Instruction]:
         Instruction(Opcode.MAX, dst=9, src_a=0, src_b=1, dtype=DataType.BF16),
         Instruction(Opcode.REDUCE_SUM, dst=10, src_a=0, dtype=DataType.BF16),
         Instruction(Opcode.REDUCE_MAX, dst=11, src_a=1, dtype=DataType.BF16),
+        Instruction(Opcode.AND, dst=12, src_a=0, src_b=2, dtype=DataType.BF16),
+        Instruction(Opcode.OR, dst=13, src_a=0, src_b=2, dtype=DataType.BF16),
+        Instruction(Opcode.XOR, dst=14, src_a=0, src_b=2, dtype=DataType.BF16),
+        Instruction(Opcode.SHL, dst=15, src_a=0, src_b=2, dtype=DataType.BF16),
+        Instruction(Opcode.SHR, dst=3, src_a=0, src_b=2, dtype=DataType.BF16),
     ]
 
 
@@ -207,3 +213,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

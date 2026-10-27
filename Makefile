@@ -9,6 +9,8 @@ verify:
 
 examples:
 	python -m grider.examples.vector_add
+	python -m grider.examples.row_sum
+	python -m grider.examples.matmul16_bf16
 	python -m grider.examples.matmul
 	python -m grider.examples.softmax
 	python -m grider.examples.layer_norm

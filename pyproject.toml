@@ -11,3 +11,7 @@ dependencies = []
 
 [tool.setuptools.packages.find]
 include = ["grider*"]
+
+[tool.setuptools.package-data]
+grider = ["programs/*.gr"]
+

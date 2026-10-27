@@ -44,6 +44,26 @@ class TileEmulatorTests(unittest.TestCase):
         tile.load_register(0, [lane % 2 for lane in range(256)], DataType.PRED)
         self.assertEqual(tile.read_register(0), [lane % 2 for lane in range(256)])
 
+    def test_bf16_bitwise_operations_preserve_raw_payload_bits(self):
+        tile = Tile()
+        tile.load_register(0, [bf16_to_float(0x3F81)] * 256, DataType.BF16)
+        tile.load_register(1, [0xFF] * 256, DataType.I32)
+        tile.step(Instruction(Opcode.AND, dst=2, src_a=0, src_b=1, dtype=DataType.BF16))
+        self.assertEqual(tile.read_register_raw(2)[0], (0x0081, DataType.BF16))
+
+        tile.load_register(1, [0x40] * 256, DataType.I32)
+        tile.step(Instruction(Opcode.OR, dst=2, src_a=0, src_b=1, dtype=DataType.BF16))
+        self.assertEqual(tile.read_register_raw(2)[0], (0x3FC1, DataType.BF16))
+        tile.step(Instruction(Opcode.XOR, dst=2, src_a=0, src_b=1, dtype=DataType.BF16))
+        self.assertEqual(tile.read_register_raw(2)[0], (0x3FC1, DataType.BF16))
+
+        tile.load_register(1, [1] * 256, DataType.I32)
+        tile.step(Instruction(Opcode.SHL, dst=2, src_a=0, src_b=1, dtype=DataType.BF16))
+        self.assertEqual(tile.read_register_raw(2)[0], (0x7F02, DataType.BF16))
+        tile.load_register(1, [8] * 256, DataType.I32)
+        tile.step(Instruction(Opcode.SHR, dst=2, src_a=0, src_b=1, dtype=DataType.BF16))
+        self.assertEqual(tile.read_register_raw(2)[0], (0x003F, DataType.BF16))
+
     def test_bf16_ties_to_even(self):
         self.assertEqual(float_to_bf16(1.0), 0x3F80)
         self.assertEqual(bf16_to_float(float_to_bf16(1.0)), 1.0)
@@ -94,3 +114,4 @@ class TileEmulatorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
