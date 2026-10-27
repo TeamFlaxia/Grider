@@ -1,4 +1,5 @@
 """Small dense matrix multiplication reference example."""
+
 from grider.kernels import matmul
 
 

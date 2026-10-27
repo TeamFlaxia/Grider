@@ -1,4 +1,5 @@
 """Stable softmax example, including an optional causal mask."""
+
 from grider.kernels import softmax_rows
 
 

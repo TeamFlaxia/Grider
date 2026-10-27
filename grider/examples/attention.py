@@ -1,4 +1,5 @@
 """Single-head scaled dot-product attention reference example."""
+
 from grider.kernels import scaled_dot_product_attention
 
 

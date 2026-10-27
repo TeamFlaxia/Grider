@@ -1,4 +1,5 @@
 """Layer normalization reference example."""
+
 from grider.kernels import layer_norm
 
 
