@@ -21,6 +21,9 @@ module grider_mesh #(
     input  logic [3:0]           dtype,
     input  logic [TILE_W*TILE_H-1:0] lane_mask,
     input  logic                 host_write_enable,
+    input  logic                 host_read_enable,
+    output logic                 host_access_ready,
+    output logic                 host_read_valid,
     input  logic                 host_memory_select,
     input  logic [7:0]           host_tile_x,
     input  logic [7:0]           host_tile_y,
@@ -58,10 +61,18 @@ module grider_mesh #(
     wire [131:0] edge_south_west [0:TILE_COUNT-1];
     wire [131:0] edge_north_west [0:TILE_COUNT-1];
     wire [TILE_COUNT-1:0] tile_ready;
+    wire mesh_issue_valid;
     wire [TILE_COUNT-1:0] tile_done;
     wire [127:0] tile_host_data [0:TILE_COUNT-1];
     wire [3:0] tile_host_type [0:TILE_COUNT-1];
     wire [TILE_COUNT-1:0] tile_host_write;
+    wire [TILE_COUNT-1:0] tile_host_read;
+    wire [TILE_COUNT-1:0] tile_host_ready;
+    wire [TILE_COUNT-1:0] tile_host_valid;
+    localparam integer TILE_SEL_W = (TILE_COUNT > 1) ? $clog2(TILE_COUNT) : 1;
+    logic [TILE_SEL_W-1:0] host_read_tile_q;
+    logic [TILE_SEL_W-1:0] host_current_tile;
+    logic host_target_valid;
 
     genvar tx;
     genvar ty;
@@ -129,12 +140,17 @@ module grider_mesh #(
 
                 assign tile_host_write[IDX] = host_write_enable &&
                     (host_tile_x == tx) && (host_tile_y == ty);
+                assign tile_host_read[IDX] = host_read_enable &&
+                    (host_tile_x == tx) && (host_tile_y == ty);
                 grider_tile #(.TILE_W(TILE_W), .TILE_H(TILE_H), .LANES(TILE_W*TILE_H)) tile (
                     .clk(clk), .rst_n(rst_n),
-                    .instruction_valid(instruction_valid),
+                    .instruction_valid(mesh_issue_valid),
                     .instruction_ready(tile_ready[IDX]),
                     .instruction_done(tile_done[IDX]),
                     .host_write_enable(tile_host_write[IDX]),
+                    .host_read_enable(tile_host_read[IDX]),
+                    .host_access_ready(tile_host_ready[IDX]),
+                    .host_read_valid(tile_host_valid[IDX]),
                     .host_memory_select(host_memory_select),
                     .host_lane(host_lane), .host_index(host_index),
                     .host_write_data(host_write_data), .host_write_type(host_write_type),
@@ -168,18 +184,38 @@ module grider_mesh #(
         end
     endgenerate
 
-    integer tile_index;
     always_comb begin
+        host_current_tile = '0;
+        host_target_valid = 1'b0;
+        if ((host_tile_x < TILES_X) && (host_tile_y < TILES_Y)) begin
+            host_current_tile = host_tile_y * TILES_X + host_tile_x;
+            host_target_valid = 1'b1;
+        end
+
+        host_access_ready = 1'b0;
+        if (host_target_valid)
+            host_access_ready = tile_host_ready[host_current_tile];
+
+        host_read_valid = 1'b0;
         host_read_data = '0;
         host_read_type = 4'h4;
-        for (tile_index = 0; tile_index < TILE_COUNT; tile_index = tile_index + 1) begin
-            if ((host_tile_y * TILES_X + host_tile_x) == tile_index) begin
-                host_read_data = tile_host_data[tile_index];
-                host_read_type = tile_host_type[tile_index];
-            end
+        if (host_read_tile_q < TILE_COUNT) begin
+            host_read_valid = tile_host_valid[host_read_tile_q];
+            host_read_data = tile_host_data[host_read_tile_q];
+            host_read_type = tile_host_type[host_read_tile_q];
         end
     end
 
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            host_read_tile_q <= '0;
+        else if (host_read_enable && !host_write_enable && host_access_ready)
+            host_read_tile_q <= host_current_tile;
+    end
+
     assign instruction_ready = &tile_ready;
+    // A mesh instruction is atomic: do not let ready tiles execute while any
+    // tile is blocked by a host request or reset.
+    assign mesh_issue_valid = instruction_valid && instruction_ready;
     assign instruction_done = &tile_done;
 endmodule

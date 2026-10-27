@@ -7,7 +7,10 @@ This document defines the architectural behavior shared by the Python model and 
 - Opcodes 0 through 19 are defined below. Reserved opcodes 20 through 31 are no-ops.
 - Data type tags 0 through 7 are defined. Tag `0xf` means inherit the source type described below; tags 8 through 14 are reserved.
 - A reserved opcode or reserved type tag completes as a no-op: registers and SRAM remain unchanged. The RTL still pulses `instruction_done` for a valid/ready issue.
-- An instruction is accepted on a rising edge when `instruction_valid && instruction_ready`. While a host write owns the tile state port, `instruction_ready` is low. Keep `instruction_valid` asserted until the instruction is accepted.
+- An instruction is accepted on a rising edge when `rst_n && instruction_valid && instruction_ready`. `instruction_ready` is high only while the tile is idle and no host read or write request is active. It stays low while an accepted instruction is in flight. A mesh broadcasts only when every tile is ready, so a stalled issue has no partial side effects. Keep `instruction_valid` asserted until the accepting edge.
+- The RTL latches the instruction at acceptance, then reads operands, executes, and writes back. The single-port register file serializes source reads: no-read instructions take 2 cycles from acceptance to completion; one-read instructions take 3; two-read instructions take 4; three-read instructions take 5. `MAC` and `SEL` use three reads. `MOVI` with an inherited type uses one read.
+- `instruction_done` is a one-cycle completion pulse after writeback, not an acceptance pulse. It is high after the edge that commits the instruction and low after the following edge unless another instruction retires. With no host request, `instruction_ready` returns high in the cycle of `instruction_done`, so the next instruction may be accepted on the following rising edge.
+- Host writes are accepted on a rising edge when `host_write_enable && host_access_ready`. Host reads use `host_read_enable && host_access_ready`; `host_read_valid` and the data/tag outputs are valid one cycle later. Avoid asserting read and write together; if both are high, the write takes priority.
 - Inactive lanes preserve their register and SRAM state.
 
 | Opcode | Mnemonic |
@@ -68,4 +71,11 @@ For arithmetic and `MOVI`, an explicit tag selects the operation and result type
 - Integer reductions wrap after each tree node at the selected width. BF16 sum rounds to BF16 at each tree node. BF16 max returns canonical quiet NaN if any active input is NaN. These opcodes support I4, I8, I16, I32, I64, and BF16; other types are no-ops.
 - An explicit type selects the reduction format. With inherited type (`0xf`), each row uses the `src_a` type of its leftmost active cell. Reductions do not cross tile boundaries.
 
+
+
+## RTL memory and pipeline
+
+Each cell's register file and local SRAM are single-port synchronous memories. Each memory word packs the 128-bit payload and 4-bit type tag together. Reset clears per-word valid bits; an unwritten word reads as zero with the I32 tag without resetting the memory array itself.
+
+An accepted instruction remains the only in-flight instruction until writeback. Operand reads are serialized to use the one memory port, then the result is captured and written back. This pipeline improves timing separation around memory reads and execution, but it does not overlap instructions; throughput is one instruction per several clock cycles. The Python emulator continues to model the architectural operation functionally and does not model this cycle count.
 

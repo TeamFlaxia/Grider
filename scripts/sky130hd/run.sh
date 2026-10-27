@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OPENROAD_IMAGE=openroad/orfs@sha256:6810dbf0e03dddbc89ed8c0a1e13cad09ce4c98d40c4ac0ab99fdc04b0676347
+mkdir -p build/sky130hd
+if [[ ! -s "$SKY130HD_LIB" ]]; then
+  echo "Missing Sky130HD Liberty file: $SKY130HD_LIB" >&2
+  exit 2
+fi
+SRAM22_DATA_DIR=build/sky130hd/sram22/sram22_64x128m4w8
+SRAM22_TAG_DIR=build/sky130hd/sram22/sram22_64x8m4w8
+for required_view in \
+  "$SRAM22_DATA_DIR/sram22_64x128m4w8.v" \
+  "$SRAM22_DATA_DIR/sram22_64x128m4w8.lef" \
+  "$SRAM22_DATA_DIR/sram22_64x128m4w8_tt_025C_1v80.lib" \
+  "$SRAM22_TAG_DIR/sram22_64x8m4w8.v" \
+  "$SRAM22_TAG_DIR/sram22_64x8m4w8.lef" \
+  "$SRAM22_TAG_DIR/sram22_64x8m4w8_tt_025C_1v80.lib"; do
+  if [[ ! -s "$required_view" ]]; then
+    echo "Missing generated SRAM22 view: $required_view" >&2
+    exit 2
+  fi
+done
+
+{
+  yosys -V
+  sram22 --version
+  echo "OpenROAD container: $OPENROAD_IMAGE"
+  docker run --rm "$OPENROAD_IMAGE" bash -lc \
+    'source /OpenROAD-flow-scripts/env.sh && openroad -version'
+} > build/sky130hd/tool-versions.txt 2>&1
+
+cat > build/sky130hd/param-check.ys <<'YOSYS'
+read_verilog -defer -sv rtl/grider_tile.sv
+hierarchy -check -chparam TILE_W 1 -chparam TILE_H 1 -chparam LANES 1 -top grider_tile
+proc
+write_json build/sky130hd/param-check.json
+YOSYS
+
+yosys -s build/sky130hd/param-check.ys 2>&1 | tee build/sky130hd/param-check.log
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+data = json.loads(Path("build/sky130hd/param-check.json").read_text())
+top = data.get("modules", {}).get("grider_tile")
+if top is None:
+    raise SystemExit("Yosys parameter check did not elaborate grider_tile")
+width = len(top.get("ports", {}).get("lane_mask", {}).get("bits", []))
+if width != 1:
+    raise SystemExit(f"Expected LANES=1 before synthesis, got lane_mask width {width}")
+print("Confirmed one-lane elaboration before synthesis.")
+PY
+
+cat > build/sky130hd/memory.ys <<'YOSYS'
+read_verilog -defer -sv rtl/grider_tile.sv
+hierarchy -check -chparam TILE_W 1 -chparam TILE_H 1 -chparam LANES 1 -top grider_tile
+proc
+opt
+memory_dff
+memory_share
+memory_collect
+write_json build/sky130hd/pre-map.json
+tee -o build/sky130hd/pre-map-stat.txt stat
+YOSYS
+
+cat > build/sky130hd/map.ys <<'YOSYS'
+read_verilog -defer -sv rtl/grider_tile.sv
+hierarchy -check -chparam TILE_W 1 -chparam TILE_H 1 -chparam LANES 1 -top grider_tile
+synth -top grider_tile -noabc
+dfflibmap -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
+abc -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
+clean
+tee -o build/sky130hd/mapped-stat.txt stat -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
+write_json build/sky130hd/mapped.json
+# Keep RTL port names, but hide complex source-derived internal names before STA export.
+rename -hide
+write_verilog -noattr -noexpr build/sky130hd/grider_tile_mapped.v
+YOSYS
+
+yosys -s build/sky130hd/memory.ys 2>&1 | tee build/sky130hd/memory.log
+yosys -s build/sky130hd/map.ys 2>&1 | tee build/sky130hd/yosys.log
+# OpenROAD's STA graph does not use Verilog wire signedness after mapping.
+python3 - <<'PY'
+from pathlib import Path
+p = Path("build/sky130hd/grider_tile_mapped.v")
+text = p.read_text()
+text = text.replace("wire signed ", "wire ")
+p.write_text(text)
+PY
+docker run --rm \
+  -v "$PWD:/work" \
+  -w /work \
+  -e SKY130HD_LIB="$SKY130HD_LIB" \
+  "$OPENROAD_IMAGE" \
+  bash -lc 'source /OpenROAD-flow-scripts/env.sh && openroad -exit scripts/sky130hd/sta.tcl' \
+  2>&1 | tee build/sky130hd/sta.log
+
+cat > build/sky130hd/macro-map.ys <<'YOSYS'
+read_verilog -defer -DGRIDER_USE_SRAM22 -sv rtl/grider_tile.sv
+read_liberty -lib build/sky130hd/sram22/sram22_64x128m4w8/sram22_64x128m4w8_tt_025C_1v80.lib
+read_liberty -lib build/sky130hd/sram22/sram22_64x8m4w8/sram22_64x8m4w8_tt_025C_1v80.lib
+hierarchy -check -chparam TILE_W 1 -chparam TILE_H 1 -chparam LANES 1 -top grider_tile
+synth -top grider_tile -noabc
+dfflibmap -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
+abc -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
+clean
+tee -o build/sky130hd/macro-mapped-stat.txt stat -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
+write_json build/sky130hd/macro-mapped.json
+rename -hide
+write_verilog -noattr -noexpr build/sky130hd/grider_tile_macro_mapped.v
+YOSYS
+
+yosys -s build/sky130hd/macro-map.ys 2>&1 | tee build/sky130hd/macro-map.log
+# OpenSTA's Verilog reader does not accept signed net declarations in the
+# mapped output. Keep the same neutralization used for the standard-cell run.
+python3 - <<'PY'
+from pathlib import Path
+p = Path("build/sky130hd/grider_tile_macro_mapped.v")
+text = p.read_text()
+text = text.replace("wire signed ", "wire ")
+p.write_text(text)
+PY
+docker run --rm \
+  -v "$PWD:/work" \
+  -w /work \
+  -e SKY130HD_LIB="$SKY130HD_LIB" \
+  "$OPENROAD_IMAGE" \
+  bash -lc 'source /OpenROAD-flow-scripts/env.sh && openroad -exit scripts/sky130hd/sta_macro.tcl' \
+  2>&1 | tee build/sky130hd/sta-macro.log
+python3 scripts/sky130hd/summarize.py
+cat build/sky130hd/report.md >> "$GITHUB_STEP_SUMMARY"
+

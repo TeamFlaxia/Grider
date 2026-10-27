@@ -1,0 +1,88 @@
+name: Sky130HD synthesis baseline
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  sky130hd-one-pe:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      SKY130HD_LIB: build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
+    steps:
+      - uses: actions/checkout@v4
+      - uses: YosysHQ/setup-oss-cad-suite@v4
+      - name: Pull OpenROAD Flow container
+        run: docker pull openroad/orfs@sha256:6810dbf0e03dddbc89ed8c0a1e13cad09ce4c98d40c4ac0ab99fdc04b0676347
+      - name: Fetch pinned Sky130HD timing library
+        env:
+          PDK_COMMIT: 5a42fd01a0eeb2338340438443c7062e198d97a4
+        run: |
+          mkdir -p build/sky130hd
+          echo "$PDK_COMMIT" > build/sky130hd/pdk-commit.txt
+          curl --fail --location --retry 3 --silent --show-error \
+            "https://raw.githubusercontent.com/efabless/skywater-pdk-libs-sky130_fd_sc_hd/$PDK_COMMIT/timing/sky130_fd_sc_hd__tt_025C_1v80.lib" \
+            --output build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
+      - name: Set up Rust for SRAM22
+        uses: dtolnay/rust-toolchain@stable
+      - name: Generate Sky130 SRAM macros
+        env:
+          SRAM22_COMMIT: 6ec35d5acc777eeaa199730d7976554e3b3fc50c
+        run: |
+          echo "$SRAM22_COMMIT" > build/sky130hd/sram22-commit.txt
+          cargo install --git https://github.com/ucb-substrate/sram22 \
+            --rev "$SRAM22_COMMIT" --locked sram22
+          sram22 --config scripts/sky130hd/sram22.toml \
+            --output-dir build/sky130hd/sram22
+          sram22 --version > build/sky130hd/sram22-version.txt
+      - name: Test tile with SRAM22 behavioral models
+        run: |
+          set -o pipefail
+          sudo apt-get update
+          sudo apt-get install -y iverilog
+          iverilog -g2012 -DGRIDER_USE_SRAM22 -s tb_grider_sram22_smoke \
+            -o build/sky130hd/sram22-smoke.vvp \
+            build/sky130hd/sram22/sram22_64x128m4w8/sram22_64x128m4w8.v \
+            build/sky130hd/sram22/sram22_64x8m4w8/sram22_64x8m4w8.v \
+            rtl/grider_tile.sv rtl/tb_grider_sram22_smoke.sv
+          vvp build/sky130hd/sram22-smoke.vvp
+          iverilog -g2012 -DGRIDER_USE_SRAM22 -s tb_grider_kernel_bench \
+            -o build/sky130hd/bf16-kernel-bench.vvp \
+            build/sky130hd/sram22/sram22_64x128m4w8/sram22_64x128m4w8.v \
+            build/sky130hd/sram22/sram22_64x8m4w8/sram22_64x8m4w8.v \
+            rtl/grider_tile.sv rtl/tb_grider_kernel_bench.sv
+          vvp build/sky130hd/bf16-kernel-bench.vvp | tee build/sky130hd/bf16-kernel-bench.log
+      - name: Synthesize and analyze timing
+        run: bash scripts/sky130hd/run.sh
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grider-sky130hd-one-pe
+          path: |
+            build/sky130hd/report.md
+            build/sky130hd/tool-versions.txt
+            build/sky130hd/param-check.log
+            build/sky130hd/pre-map.json
+            build/sky130hd/pre-map-stat.txt
+            build/sky130hd/mapped.json
+            build/sky130hd/mapped-stat.txt
+            build/sky130hd/grider_tile_mapped.v
+            build/sky130hd/memory.log
+            build/sky130hd/yosys.log
+            build/sky130hd/sta.log
+            build/sky130hd/macro-mapped-stat.txt
+            build/sky130hd/macro-mapped.json
+            build/sky130hd/grider_tile_macro_mapped.v
+            build/sky130hd/macro-map.log
+            build/sky130hd/sta-macro.log
+            build/sky130hd/sram22-commit.txt
+            build/sky130hd/sram22-version.txt
+            build/sky130hd/bf16-kernel-bench.log
+            build/sky130hd/sram22/**/*.lef
+            build/sky130hd/sram22/**/*.lib
+            build/sky130hd/sram22/**/*.v
+            build/sky130hd/sram22/**/*.gds.gz
+          if-no-files-found: warn
+
