@@ -2,50 +2,43 @@
 
 ## Organization
 
-The Grider machine is a two-dimensional mesh of tiles. A tile has 16×16 = 256 cells and one instruction decoder. It decodes once and broadcasts the operation to all active cells; cells do not fetch or decode instructions independently. The RTL mesh defaults to 2×2 tiles and is parameterized for larger rectangular arrays.
+Grider is a two-dimensional mesh of tiles. Each tile contains 16×16 = 256 cells and one instruction decoder. The tile decodes once and broadcasts each instruction to its active cells; cells do not fetch or decode instructions independently. The RTL mesh defaults to 2×2 tiles and is parameterized for rectangular arrays.
 
-Each cell owns a 16×132-bit register file and a 16×132-bit local SRAM. The default RTL describes each as a single-port synchronous memory; payload and type tag share one 132-bit word. A small valid bitmap supplies the architectural reset value, so the memory words themselves do not need reset circuitry. For Sky130 macro builds, defining `GRIDER_USE_SRAM22` replaces each array with a 64×128-bit payload macro and a 64×8-bit tag macro; the logical interface still exposes 16 words. The host/debug port initializes words and reads them back through a one-cycle request/valid handshake.
+Each cell owns sixteen 132-bit architectural registers (128-bit payload plus a 4-bit type tag) and sixteen 132-bit private SRAM words. This is a functional prototype capacity, not an area-optimized memory design. In the RTL, each is a single-port synchronous memory with payload and type tag packed into one word. A valid bitmap supplies the reset value without clearing the memory array. Sky130 builds can define `GRIDER_USE_SRAM22` to map each logical memory to payload and tag SRAM macros. The host/debug port initializes state and reads it back.
 
-The lane mask has one bit per cell. Inactive lanes hold both register and SRAM state. A neighbor instruction reads a pre-instruction snapshot; all cells and tiles commit their writes together in the writeback stage. Within-tile routes are combinational. At tile boundaries, the selected source values are sent through halo buses after the synchronous register read. At the outer boundary of the mesh, a missing neighbor reads as zero with the source type tag.
+Each instruction has a 256-bit lane mask. Inactive cells hold register and SRAM state. Neighbor operations observe the pre-instruction state and commit writes together in writeback. Within-tile routes are combinational; tile edges connect through halo buses. An absent neighbor at the outside mesh edge returns zero tagged with the source cell's type.
 
-Neighbor direction encoding is N, NE, E, SE, S, SW, W, NW (0–7). Tile coordinates are row-major in the software mesh model; cell coordinates are row-major within each tile.
+Neighbor direction is N, NE, E, SE, S, SW, W, NW (0–7). Tile and cell indices are row-major.
 
-## Data formats
+## Data types and ISA
 
 | Tag | Format | Arithmetic behavior |
 | --- | --- | --- |
-| `I4` | signed 4-bit integer | wraps modulo 16; interpreted as signed on reads |
-| `I8` | signed 8-bit integer | wraps modulo 256; interpreted as signed on reads |
-| `BF16` | bfloat16 | add, subtract, multiply, MAC, min and max; round-to-nearest, ties-to-even |
-| `I16`, `I32`, `I64` | signed integers | wrap to the selected width |
-| `U128` | unsigned 128-bit vector | bit operations and payload movement |
-| `PRED` | predicate | nonzero means true |
+| `I4` | signed 4-bit integer | wraps modulo 16 |
+| `I8` | signed 8-bit integer | wraps modulo 256 |
+| `BF16` | bfloat16 | round-to-nearest, ties-to-even |
+| `I16`, `I32`, `I64` | signed integer | wraps to selected width |
+| `U128` | unsigned 128-bit vector | payload bit operations |
+| `PRED` | predicate | low bit, nonzero means true |
 
-BF16 MAC rounds the product to BF16 and then rounds the accumulated sum to BF16. The standalone `gemm16` reference instead accumulates in host float and rounds once at the output; use the instruction emulator when matching hardware BF16 accumulation behavior.
+Opcodes 0–19 are defined in [ISA v0.1](isa.md). They include MOV/MOVI, arithmetic, bitwise operations, shifts, MIN/MAX/SEL, NEIGHBOR, LOAD/STORE, and row reductions. Reserved opcodes and type tags are no-ops.
 
-## Instruction sketch
+BF16 MAC rounds the product to BF16, adds it to the accumulator, then rounds the sum. BF16 row sum rounds at each tree node. BF16 max returns canonical quiet NaN if a participating input is NaN.
 
-| Operation | Behavior |
-| --- | --- |
-| `MOV`, `MOVI` | copy a typed value or load an immediate |
-| `ADD`, `SUB`, `MUL`, `MAC` | lane-wise numeric arithmetic; MAC adds product to old `dst` |
-| `AND`, `OR`, `XOR`, `SHL`, `SHR` | payload bit operations |
-| `MIN`, `MAX` | signed integer or BF16 comparison |
-| `SEL` | `dst = src_a != 0 ? src_b : src_c` |
-| `NEIGHBOR` | copy one of eight adjacent cell values |
-| `LOAD`, `STORE` | read/write one word of each active cell's local SRAM |
+## Reduction behavior
 
-An instruction carries `opcode`, destination/source register indices, a 128-bit immediate, a type selector, and a 256-bit lane mask. The type selector `0xf` inherits `src_a`'s type, or `src_b` for `SEL`. The complete type, reserved-encoding, immediate, and operation rules are in [docs/isa.md](isa.md). `LOAD`/`STORE` use `imm[3:0]`; `NEIGHBOR` uses `imm[2:0]`.
+`REDUCE_SUM` and `REDUCE_MAX` operate on each tile row independently; they do not cross tile boundaries. The reduction uses a balanced binary tree: adjacent pairs are combined, then groups of 4, 8, and 16 cells. The lane mask selects both participating values and destination lanes. Each active lane receives the row result; inactive cells hold their state. A row with no active lanes has no output.
+
+An explicit type selector is applied to every operand and the result. With inherited type, a row uses the `src_a` tag of its leftmost active lane. Integer sums wrap at each tree node. Unsupported numeric type combinations are no-ops.
 
 ## Python and RTL contract
 
-`grider.sim.Tile.step` models one tile instruction. `grider.sim.Mesh.step` broadcasts one instruction to a rectangular mesh and snapshots values for cross-tile neighbor reads. The RTL equivalent is `grider_tile` plus the `grider_mesh` wrapper. Both expose host/debug state access in hardware; the Python model uses `load_register`, `load_sram`, and read methods.
+`grider.sim.Tile.step` models one tile instruction. `grider.sim.Mesh.step` broadcasts instructions to tiles and snapshots state for cross-tile neighbor reads. `rtl/grider_tile.sv` and `rtl/grider_mesh.sv` implement the matching interfaces.
 
-`python -m grider.verify_rtl` initializes a tile through the host port, issues the same integer and BF16 instruction stream to both models, and compares every register and SRAM payload and tag. `python -m grider.verify_mesh_rtl` compares every register in a 2×2 RTL mesh after testing all eight halo directions. The RTL testbenches also check the host read-valid handshake, busy/ready behavior, delayed completion, and atomic mesh issue. The GitHub Actions workflow runs those checks.
+`python -m grider.verify_rtl` feeds the same instruction stream to both models and compares every register and SRAM payload/tag. It covers arithmetic, masking, SRAM, neighbor reads, and row reductions. `python -m grider.verify_mesh_rtl` checks the eight halo directions in a 2×2 RTL mesh. The RTL testbenches also check host read-valid, ready/busy behavior, instruction completion, and mesh issue. GitHub Actions runs these checks.
 
-## AI kernel examples and current scope
+## Kernel examples and current scope
 
-`grider.kernels` contains dependency-free host reference implementations for matmul, row softmax, layer norm, scaled dot-product attention, and GELU. `grider.examples` provides runnable demonstrations, including a tiny two-layer MLP. These reference kernels are not yet lowered to Grider instruction programs. The tile ISA has the arithmetic and local communication building blocks; a tiled GEMM mapping, multi-head batching, compiler, instruction fetch, and host runtime remain follow-on work.
+`grider.kernels` and `grider.examples` provide host-side reference kernels for matmul, row softmax, layer norm, attention, and MLP. They are not yet lowered to Grider instruction programs.
 
-The Python model is functional rather than cycle-, area-, or power-accurate. The RTL uses synchronous single-port memories and processes one instruction at a time through operand-read, execute, and writeback stages. Multi-source operands are read in separate cycles, so instructions do not overlap and latency depends on the number of reads. This stage structure shortens the memory-to-arithmetic path; it does not yet provide one-instruction-per-cycle throughput. SRAM macro mapping, banking, deeper arithmetic pipelines, mesh links between physically separate chips, exceptions, and cache coherence remain follow-on work.
-
+The prototype has no instruction fetch unit, compiler, GEMM sequencer, performance counters, or fault-recovery logic. The RTL handles one instruction at a time through operand-read, execute, and writeback stages. Multi-source reads are serialized, so instructions do not overlap; the stages shorten the memory-to-arithmetic path but do not yet provide one-instruction-per-cycle throughput. The Python model is functional, not cycle-, area-, or power-accurate.

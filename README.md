@@ -2,25 +2,21 @@
 
 Grider is an experimental cellular SIMD processor. It places 16×16-cell compute tiles in a two-dimensional mesh. One instruction is decoded per tile and broadcast to all 256 cells; each cell has its own ALU/MAC, register file, local SRAM, and no instruction decoder.
 
-The repository now contains a functional Python emulator, matching tile and mesh RTL, common AI-kernel reference examples, and automated Python/RTL comparison.
+The repository contains a functional Python emulator, matching tile and mesh RTL, AI-kernel reference examples, and automated Python/RTL comparison. Current milestone tracking is in [TODO.md](TODO.md); the complete v0.1 instruction semantics are in [docs/isa.md](docs/isa.md).
 
 ## Architecture
 
-The complete instruction encoding and defined behavior are in [docs/isa.md](docs/isa.md).
+- Each cell has 16 typed 128-bit registers and 16 private 128-bit SRAM words. Each value carries a 4-bit type tag.
+- Numeric formats include signed INT4, INT8, INT16, INT32, INT64 and BF16, plus unsigned 128-bit values and predicates.
+- The ISA includes arithmetic, bitwise operations, lane selection, private SRAM access, eight-neighbor movement, and row-wise sum/max reductions.
+- A 256-bit lane mask selects participants and writers. The 2D tile mesh connects edge values as eight-neighbor halos.
+- BF16 add/subtract/multiply/MAC/min/max and row reductions are implemented in Python and RTL. BF16 arithmetic uses round-to-nearest, ties-to-even; INT arithmetic wraps at the selected width.
 
-- Each cell has 16 typed 128-bit registers and 16 private 128-bit SRAM words. Each register or SRAM word carries a 4-bit type tag.
-- Supported numeric tags include signed INT4, INT8, INT16, INT32, INT64 and BF16, plus unsigned 128-bit bit vectors and predicates.
-- The instruction set includes MOV/MOVI, ADD/SUB/MUL/MAC, bitwise operations, shifts, MIN/MAX/SEL, local LOAD/STORE and 8-neighbor reads.
-- `SEL` uses three source registers: `src_a` is the predicate, `src_b` is selected when true, and `src_c` when false.
-- A 256-bit lane mask keeps inactive cells unchanged.
-- The 2D mesh broadcasts instructions to every tile and connects tile-edge values as synchronous 8-neighbor halos. Mesh-edge reads return zero.
-- BF16 add/subtract/multiply/MAC/min/max are implemented in both Python and RTL with round-to-nearest, ties-to-even. INT4/INT8 arithmetic wraps at the selected width.
-
-The hardware includes an external host/debug port for initializing and reading cell state. It does not include a program fetch unit, compiler, or GEMM microcode generator. Matrix multiplication in hardware is scheduled as data movement plus repeated MAC instructions; the Python `gemm16` and `grider.kernels.matmul` functions are reference oracles.
+The RTL has a host/debug port for initializing and reading cell state, but no program fetch unit, compiler, or GEMM microcode generator. Hardware GEMM is scheduled using data movement and repeated MAC instructions. The Python `gemm16` and `grider.kernels.matmul` functions are reference oracles.
 
 ## Run examples
 
-Python 3.10+; no third-party packages are needed for the emulator or kernel examples.
+Python 3.10+; no third-party packages are required for the emulator or examples.
 
 ```sh
 python -m grider.examples.vector_add
@@ -31,11 +27,11 @@ python -m grider.examples.attention
 python -m grider.examples.mlp
 ```
 
-The AI examples cover dense matmul, stable and causal softmax, layer normalization, single-head scaled dot-product attention, and a two-layer MLP with GELU. They are clear host-side reference kernels, not yet compiler-lowered SIMD programs.
+These examples cover dense matmul, stable and causal softmax, layer normalization, single-head scaled dot-product attention, and a two-layer MLP with GELU. They are host-side references, not yet compiler-lowered SIMD programs.
 
 ## Verify
 
-Install Icarus Verilog (`iverilog` and `vvp`) to compare the emulator and RTL:
+Install Icarus Verilog (`iverilog` and `vvp`) to compare Python and RTL:
 
 ```sh
 python -m unittest discover -s tests -v
@@ -43,6 +39,6 @@ python -m grider.verify_rtl
 python -m grider.verify_mesh_rtl
 ```
 
-The tile comparison feeds the same instruction stream to Python and RTL, then compares all 8,192 register/SRAM words across 256 cells. It covers integer operations, BF16 edge and random finite cases, masking, local memory and neighbors. The mesh comparison checks all eight halo directions across four tiles. GitHub Actions runs both comparisons and all examples on pushes and pull requests.
+The tile check compares all 8,192 register/SRAM words across 256 cells after the same instruction stream, including BF16 edge cases and row reductions. The mesh check covers all eight halo directions in a 2×2 mesh. GitHub Actions runs the unit tests, RTL comparisons and examples.
 
 See [docs/architecture.md](docs/architecture.md), [rtl/grider_tile.sv](rtl/grider_tile.sv), and [rtl/grider_mesh.sv](rtl/grider_mesh.sv).

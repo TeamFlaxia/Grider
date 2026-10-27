@@ -49,6 +49,8 @@ class Opcode(IntEnum):
     NEIGHBOR = 15
     LOAD = 16
     STORE = 17
+    REDUCE_SUM = 18
+    REDUCE_MAX = 19
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,7 @@ _NUMERIC_DTYPES = frozenset({
 })
 _NUMERIC_OPS = frozenset({
     Opcode.ADD, Opcode.SUB, Opcode.MUL, Opcode.MAC, Opcode.MIN, Opcode.MAX,
+    Opcode.REDUCE_SUM, Opcode.REDUCE_MAX,
 })
 
 
@@ -237,6 +240,48 @@ class Tile:
         immediate = int(insn.imm) & MASK128
         address = immediate & (LOCAL_WORDS - 1)
         direction = immediate & 0x7
+
+        if op in (Opcode.REDUCE_SUM, Opcode.REDUCE_MAX):
+            for row in range(self.height):
+                lanes = [row * self.width + col for col in range(self.width)]
+                active = [lane for lane in lanes if (insn.lane_mask >> lane) & 1]
+                if not active:
+                    continue
+                out_type = dtype if dtype is not None else self._rf[active[0]][insn.src_a].dtype
+                if not _supports_dtype(op, out_type):
+                    continue
+                row_values = [self._rf[lane][insn.src_a] for lane in active]
+                has_nan = out_type == DataType.BF16 and any(
+                    math.isnan(_decode(value, out_type)) for value in row_values
+                )
+                if has_nan:
+                    result = _Register(0x7FC0, DataType.BF16)
+                else:
+                    partial: list[_Register | None] = [
+                        self._rf[lane][insn.src_a] if (insn.lane_mask >> lane) & 1 else None
+                        for lane in lanes
+                    ]
+                    stride = 1
+                    while stride < self.width:
+                        for start in range(0, self.width, stride * 2):
+                            left = partial[start]
+                            right = partial[start + stride]
+                            if left is None:
+                                partial[start] = right
+                            elif right is not None:
+                                left_value = _decode(left, out_type)
+                                right_value = _decode(right, out_type)
+                                value = left_value + right_value if op == Opcode.REDUCE_SUM else max(left_value, right_value)
+                                payload = (float_to_bf16(float(value)) if out_type == DataType.BF16
+                                           else _pack(int(value), out_type))
+                                partial[start] = _Register(payload, out_type)
+                        stride *= 2
+                    result = partial[0]
+                assert result is not None
+                for lane in active:
+                    self._rf[lane][insn.dst] = _Register(result.payload, result.dtype)
+            self.cycles += 1
+            return
 
         # Stage register writes before commit so in-place neighbor operations
         # read the pre-instruction state.
@@ -426,3 +471,4 @@ def gemm16(a: Sequence[Sequence[int | float]], b: Sequence[Sequence[int | float]
             output_row.append(bf16_to_float(float_to_bf16(float(acc))) if dtype == DataType.BF16 else _signed(int(acc), 32))
         result.append(output_row)
     return result
+

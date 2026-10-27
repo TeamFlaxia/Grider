@@ -63,6 +63,34 @@ class TileEmulatorTests(unittest.TestCase):
         self.assertEqual(result_west[31], 1016)
         self.assertEqual(result_east[255], 0)
 
+    def test_masked_row_reduction_broadcasts_to_active_lanes(self):
+        tile = Tile()
+        values = [lane % 16 - 8 for lane in range(256)]
+        tile.load_register(0, values, DataType.I8)
+        mask = sum(1 << lane for lane in range(256) if lane % 16 in (1, 4, 7, 10, 13))
+        tile.step(Instruction(Opcode.REDUCE_SUM, dst=1, src_a=0,
+                              dtype=DataType.I8, lane_mask=mask))
+        result = tile.read_register(1)
+        active_cols = (1, 4, 7, 10, 13)
+        expected = [sum(values[col] for col in active_cols) if col in active_cols else 0
+                    for col in range(16)]
+        self.assertEqual([result[lane] for lane in range(16)], expected)
+
+    def test_bf16_row_reduction_uses_tree_rounding(self):
+        tile = Tile()
+        tile.load_register(0, [1.0] * 256, DataType.BF16)
+        tile.step(Instruction(Opcode.REDUCE_SUM, dst=1, src_a=0, dtype=DataType.BF16))
+        self.assertEqual(tile.read_register(1), [16.0] * 256)
+
+    def test_reduction_single_active_lane_and_empty_rows(self):
+        tile = Tile()
+        tile.load_register(0, [lane % 16 - 8 for lane in range(256)], DataType.I8)
+        tile.step(Instruction(Opcode.REDUCE_SUM, dst=1, src_a=0,
+                              dtype=DataType.I8, lane_mask=1 << 7))
+        result = tile.read_register(1)
+        self.assertEqual(result[7], -1)
+        self.assertEqual(sum(value != 0 for value in result), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
