@@ -1,11 +1,11 @@
-# Grider v0.1 instruction semantics
+# Grider v0.2 instruction semantics
 
-This document defines the architectural behavior shared by the Python model and the RTL. Version 0.1 adds row reductions at opcodes 18 and 19; all other v0 encodings retain their behavior. The Python `Tile.step` API represents an already accepted instruction; it does not model host-port backpressure timing.
+This document defines the architectural behavior shared by the Python model and the RTL. Version 0.2 adds FP32 accumulation for BF16 MAC and an explicit BF16/FP32 conversion at opcode 20. Version 0.1 added row reductions at opcodes 18 and 19. The Python `Tile.step` API represents an already accepted instruction; it does not model host-port backpressure timing.
 
 ## Encoding and issue
 
-- Opcodes 0 through 19 are defined below. Reserved opcodes 20 through 31 are no-ops.
-- Data type tags 0 through 7 are defined. Tag `0xf` means inherit the source type described below; tags 8 through 14 are reserved.
+- Opcodes 0 through 20 are defined below. Reserved opcodes 21 through 31 are no-ops.
+- Data type tags 0 through 8 are defined. Tag `0xf` means inherit the source type described below; tags 9 through 14 are reserved.
 - A reserved opcode or reserved type tag completes as a no-op: registers and SRAM remain unchanged. The RTL still pulses `instruction_done` for a valid/ready issue.
 - An instruction is accepted on a rising edge when `rst_n && instruction_valid && instruction_ready`. `instruction_ready` is high only while the tile is idle and no host read or write request is active. It stays low while an accepted instruction is in flight. A mesh broadcasts only when every tile is ready, so a stalled issue has no partial side effects. Keep `instruction_valid` asserted until the accepting edge.
 - The RTL latches the instruction at acceptance, then reads operands, executes, and writes back. The single-port register file serializes source reads: no-read instructions take 2 cycles from acceptance to completion; one-read instructions take 3; two-read instructions take 4; three-read instructions take 5. `MAC` and `SEL` use three reads. `MOVI` with an inherited type uses one read.
@@ -35,6 +35,7 @@ This document defines the architectural behavior shared by the Python model and 
 | 17 | `STORE` |
 | 18 | `REDUCE_SUM` |
 | 19 | `REDUCE_MAX` |
+| 20 | `CONVERT` |
 
 ## Payload representation
 
@@ -46,12 +47,13 @@ Register and SRAM payloads are 128 bits with a four-bit type tag. Typed scalar p
 | BF16 | Low 16 bits |
 | PRED | Low bit |
 | U128 | All 128 bits |
+| F32 | Low 32 bits, IEEE-754 binary32 |
 
-Signed integer arithmetic interprets the selected width as two's complement and wraps modulo that width. BF16 arithmetic rounds to nearest, ties to even. BF16 MAC rounds the product to BF16 before adding it to the accumulator, then rounds the sum.
+Signed integer arithmetic interprets the selected width as two's complement and wraps modulo that width. BF16 arithmetic rounds to nearest, ties to even. For a BF16 `MAC`, `src_a` and `src_b` are BF16 values and `dst` is the accumulator. The first MAC treats a non-F32 destination as a BF16 accumulator; the result is stored as F32. Later MACs read that F32 accumulator and preserve its precision. Use `CONVERT` with dtype BF16 after the final MAC to round the accumulated value to BF16.
 
 ## Type selection
 
-For arithmetic and `MOVI`, an explicit tag selects the operation and result type. Tag `0xf` inherits `src_a`'s type, except `SEL`, which inherits `src_b`'s type. Both arithmetic operands and the MAC accumulator are interpreted at that selected type, even if their stored tags differ.
+For arithmetic and `MOVI`, an explicit tag selects the operation and result type. Tag `0xf` inherits `src_a`'s type, except `SEL`, which inherits `src_b`'s type. Arithmetic operands are interpreted at the selected type even if their stored tags differ. BF16 `MAC` is the exception: its two inputs are BF16, while its destination is interpreted as F32 after the first result has been written.
 
 `MOV` copies `src_a` and preserves its tag; its type field is ignored. `SEL` tests whether the raw `src_a` payload is nonzero, then copies the selected `src_b` or `src_c` payload into the result type. The selected payload is reinterpreted and truncated to that type; it is not numerically converted.
 
@@ -66,6 +68,8 @@ For arithmetic and `MOVI`, an explicit tag selects the operation and result type
 - `NEIGHBOR` uses `imm[2:0]` as N, NE, E, SE, S, SW, W, NW (0–7). Higher immediate bits are ignored.
 - `LOAD` and `STORE` use `imm[3:0]` as the local SRAM address. Higher immediate bits are ignored.
 - `MOVI` uses the immediate's low bits and normalizes them to the selected type.
+- `CONVERT` converts between BF16 and F32. Its dtype field selects the destination format; the source format comes from the `src_a` type tag. Other source/destination combinations complete as no-ops.
+- F32 is an accumulator/result storage format for BF16 MAC. General F32 arithmetic opcodes are not defined in v0.2.
 - `REDUCE_SUM` and `REDUCE_MAX` reduce one 16-cell row within a tile. Columns are paired as (0,1), (2,3), and so on, then combined in a balanced tree with strides 2, 4, and 8.
 - The lane mask selects both reduction inputs and destination cells. The same row result is written to each active cell in that row; inactive lanes retain their state. A row with no active lanes has no result.
 - Integer reductions wrap after each tree node at the selected width. BF16 sum rounds to BF16 at each tree node. BF16 max returns canonical quiet NaN if any active input is NaN. These opcodes support I4, I8, I16, I32, I64, and BF16; other types are no-ops.

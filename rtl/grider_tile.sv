@@ -80,6 +80,7 @@ module grider_tile #(
     localparam logic [4:0] OP_STORE    = 5'd17;
     localparam logic [4:0] OP_REDUCE_SUM = 5'd18;
     localparam logic [4:0] OP_REDUCE_MAX = 5'd19;
+    localparam logic [4:0] OP_CONVERT = 5'd20;
 
     localparam logic [3:0] DT_I4 = 4'h0;
     localparam logic [3:0] DT_I8 = 4'h1;
@@ -89,13 +90,14 @@ module grider_tile #(
     localparam logic [3:0] DT_I64 = 4'h5;
     localparam logic [3:0] DT_U128 = 4'h6;
     localparam logic [3:0] DT_PRED = 4'h7;
+    localparam logic [3:0] DT_F32 = 4'h8;
     // 4'hf asks the datapath to inherit src_a's type (src_b for SEL).
     localparam logic [3:0] DT_INHERIT = 4'hf;
 
     function automatic logic dtype_is_valid(input logic [3:0] tag);
         begin
             case (tag)
-                DT_I4, DT_I8, DT_BF16, DT_I16, DT_I32, DT_I64, DT_U128, DT_PRED:
+                DT_I4, DT_I8, DT_BF16, DT_I16, DT_I32, DT_I64, DT_U128, DT_PRED, DT_F32:
                     dtype_is_valid = 1'b1;
                 default: dtype_is_valid = 1'b0;
             endcase
@@ -124,7 +126,7 @@ module grider_tile #(
     );
         begin
             case (operation)
-                OP_MOV, OP_ADD, OP_SUB, OP_MUL, OP_MAC,
+                OP_MOV, OP_ADD, OP_SUB, OP_MUL, OP_MAC, OP_CONVERT,
                 OP_AND, OP_OR, OP_XOR, OP_SHL, OP_SHR,
                 OP_MIN, OP_MAX, OP_SEL, OP_NEIGHBOR, OP_STORE,
                 OP_REDUCE_SUM, OP_REDUCE_MAX:
@@ -455,6 +457,7 @@ module grider_tile #(
                 DT_BF16: truncate_by_type = {{112{1'b0}}, value[15:0]};
                 DT_I16: truncate_by_type = {{112{1'b0}}, value[15:0]};
                 DT_I32: truncate_by_type = {{96{1'b0}}, value[31:0]};
+                DT_F32: truncate_by_type = {{96{1'b0}}, value[31:0]};
                 DT_I64: truncate_by_type = {{64{1'b0}}, value[63:0]};
                 DT_PRED: truncate_by_type = {{127{1'b0}}, value[0]};
                 default: truncate_by_type = value;
@@ -670,6 +673,221 @@ module grider_tile #(
             else if (a_value[15] != b_value[15]) bf16_less_than = a_value[15];
             else if (a_value[15]) bf16_less_than = (a_value[14:0] > b_value[14:0]);
             else bf16_less_than = (a_value[14:0] < b_value[14:0]);
+        end
+    endfunction
+
+    function automatic logic [31:0] bf16_to_f32(input logic [15:0] value);
+        begin
+            bf16_to_f32 = {value, 16'b0};
+        end
+    endfunction
+
+    function automatic logic [15:0] f32_to_bf16(input logic [31:0] value);
+        logic [15:0] upper;
+        logic [15:0] rounded;
+        begin
+            upper = value[31:16];
+            if ((value[30:23] == 8'hff) && (value[22:0] != 0)) begin
+                f32_to_bf16 = 16'h7fc0;
+            end else begin
+                rounded = upper;
+                if ((value[15:0] > 16'h8000) ||
+                    ((value[15:0] == 16'h8000) && upper[0]))
+                    rounded = upper + 1'b1;
+                f32_to_bf16 = rounded;
+            end
+        end
+    endfunction
+
+    function automatic logic [26:0] f32_shift_right_sticky(
+        input logic [26:0] value,
+        input integer amount
+    );
+        logic [26:0] shifted;
+        logic sticky;
+        integer shift_i;
+        begin
+            if (amount <= 0) begin
+                shifted = value;
+            end else if (amount >= 27) begin
+                shifted = {26'b0, |value};
+            end else begin
+                shifted = value >> amount;
+                sticky = 1'b0;
+                for (shift_i = 0; shift_i < 27; shift_i = shift_i + 1)
+                    if (shift_i < amount) sticky = sticky | value[shift_i];
+                shifted[0] = shifted[0] | sticky;
+            end
+            f32_shift_right_sticky = shifted;
+        end
+    endfunction
+
+    function automatic logic [31:0] f32_round_pack(
+        input logic sign_bit,
+        input integer exponent_in,
+        input logic [26:0] ext_in
+    );
+        integer exponent;
+        logic [26:0] ext;
+        logic [24:0] rounded;
+        begin
+            exponent = exponent_in;
+            ext = ext_in;
+            if (exponent < 1) begin
+                ext = f32_shift_right_sticky(ext, 1 - exponent);
+                exponent = 1;
+            end
+            rounded = {1'b0, ext[26:3]} +
+                ((ext[2] && (ext[1] || ext[0] || ext[3])) ? 25'd1 : 25'd0);
+            if (rounded[24]) begin
+                rounded = rounded >> 1;
+                exponent = exponent + 1;
+            end
+            if (exponent >= 255) begin
+                f32_round_pack = {sign_bit, 8'hff, 23'b0};
+            end else if ((exponent == 1) && !rounded[23]) begin
+                f32_round_pack = {sign_bit, 8'h00, rounded[22:0]};
+            end else begin
+                f32_round_pack = {sign_bit, exponent[7:0], rounded[22:0]};
+            end
+        end
+    endfunction
+
+    function automatic logic [31:0] f32_add(
+        input logic [31:0] a_value,
+        input logic [31:0] b_value
+    );
+        logic sign_a;
+        logic sign_b;
+        logic sign_result;
+        logic [7:0] exp_a_field;
+        logic [7:0] exp_b_field;
+        integer exp_a;
+        integer exp_b;
+        integer exponent;
+        logic [23:0] sig_a;
+        logic [23:0] sig_b;
+        logic [26:0] ext_a;
+        logic [26:0] ext_b;
+        logic [26:0] large_ext;
+        logic [26:0] small_ext;
+        logic [26:0] aligned_small;
+        logic [27:0] work_ext;
+        integer norm_i;
+        begin
+            sign_a = a_value[31];
+            sign_b = b_value[31];
+            exp_a_field = a_value[30:23];
+            exp_b_field = b_value[30:23];
+            if (((exp_a_field == 8'hff) && (a_value[22:0] != 0)) ||
+                ((exp_b_field == 8'hff) && (b_value[22:0] != 0)) ||
+                ((exp_a_field == 8'hff) && (exp_b_field == 8'hff) && (sign_a != sign_b))) begin
+                f32_add = 32'h7fc00000;
+            end else if (exp_a_field == 8'hff) begin
+                f32_add = a_value;
+            end else if (exp_b_field == 8'hff) begin
+                f32_add = b_value;
+            end else if (((a_value[30:0] == 0) && (b_value[30:0] == 0))) begin
+                f32_add = {sign_a & sign_b, 31'b0};
+            end else begin
+                exp_a = (exp_a_field == 0) ? 1 : exp_a_field;
+                exp_b = (exp_b_field == 0) ? 1 : exp_b_field;
+                sig_a = {(exp_a_field != 0), a_value[22:0]};
+                sig_b = {(exp_b_field != 0), b_value[22:0]};
+                ext_a = {sig_a, 3'b000};
+                ext_b = {sig_b, 3'b000};
+                if ((exp_a > exp_b) || ((exp_a == exp_b) && (sig_a >= sig_b))) begin
+                    exponent = exp_a;
+                    large_ext = ext_a;
+                    small_ext = ext_b;
+                    sign_result = sign_a;
+                    aligned_small = f32_shift_right_sticky(small_ext, exp_a - exp_b);
+                end else begin
+                    exponent = exp_b;
+                    large_ext = ext_b;
+                    small_ext = ext_a;
+                    sign_result = sign_b;
+                    aligned_small = f32_shift_right_sticky(small_ext, exp_b - exp_a);
+                end
+                if (sign_a == sign_b)
+                    work_ext = {1'b0, large_ext} + {1'b0, aligned_small};
+                else
+                    work_ext = {1'b0, large_ext} - {1'b0, aligned_small};
+                if (work_ext == 0) begin
+                    f32_add = 32'b0;
+                end else begin
+                    if (work_ext[27]) begin
+                        work_ext = {1'b0, f32_shift_right_sticky(work_ext[26:0], 1)};
+                        exponent = exponent + 1;
+                    end else begin
+                        for (norm_i = 0; norm_i < 27; norm_i = norm_i + 1) begin
+                            if (!work_ext[26] && (exponent > 1)) begin
+                                work_ext = work_ext << 1;
+                                exponent = exponent - 1;
+                            end
+                        end
+                    end
+                    f32_add = f32_round_pack(sign_result, exponent, work_ext[26:0]);
+                end
+            end
+        end
+    endfunction
+
+    function automatic logic [31:0] f32_mul(
+        input logic [31:0] a_value,
+        input logic [31:0] b_value
+    );
+        logic sign_result;
+        logic [7:0] exp_a_field;
+        logic [7:0] exp_b_field;
+        integer exp_a;
+        integer exp_b;
+        integer exponent;
+        integer norm_i;
+        logic [23:0] sig_a;
+        logic [23:0] sig_b;
+        logic [47:0] product;
+        logic [26:0] ext;
+        begin
+            sign_result = a_value[31] ^ b_value[31];
+            exp_a_field = a_value[30:23];
+            exp_b_field = b_value[30:23];
+            sig_a = {(exp_a_field != 0), a_value[22:0]};
+            sig_b = {(exp_b_field != 0), b_value[22:0]};
+            exp_a = (exp_a_field == 0) ? 1 : exp_a_field;
+            exp_b = (exp_b_field == 0) ? 1 : exp_b_field;
+            for (norm_i = 0; norm_i < 23; norm_i = norm_i + 1) begin
+                if ((sig_a != 0) && !sig_a[23]) begin
+                    sig_a = sig_a << 1;
+                    exp_a = exp_a - 1;
+                end
+                if ((sig_b != 0) && !sig_b[23]) begin
+                    sig_b = sig_b << 1;
+                    exp_b = exp_b - 1;
+                end
+            end
+            product = sig_a * sig_b;
+            if (((exp_a_field == 8'hff) && (a_value[22:0] != 0)) ||
+                ((exp_b_field == 8'hff) && (b_value[22:0] != 0)) ||
+                (((exp_a_field == 8'hff) || (exp_b_field == 8'hff)) &&
+                 (((a_value[30:0] == 0)) || (b_value[30:0] == 0)))) begin
+                f32_mul = 32'h7fc00000;
+            end else if ((exp_a_field == 8'hff) || (exp_b_field == 8'hff)) begin
+                f32_mul = {sign_result, 8'hff, 23'b0};
+            end else if ((sig_a == 0) || (sig_b == 0)) begin
+                f32_mul = {sign_result, 31'b0};
+            end else begin
+                exponent = exp_a + exp_b - 127;
+                if (product[47]) begin
+                    exponent = exponent + 1;
+                    ext = product[47:21];
+                    ext[0] = ext[0] | (|product[20:0]);
+                end else begin
+                    ext = product[46:20];
+                    ext[0] = ext[0] | (|product[19:0]);
+                end
+                f32_mul = f32_round_pack(sign_result, exponent, ext);
+            end
         end
     endfunction
 
@@ -933,6 +1151,19 @@ module grider_tile #(
                         lane_result_type[lane] = lane_dtype[lane];
                         lane_write[lane] = 1'b1;
                     end
+                    OP_CONVERT: begin
+                        if ((lane_dtype[lane] == DT_BF16) &&
+                            (operand_a[lane][131:128] == DT_F32)) begin
+                            lane_result[lane] = {112'b0, f32_to_bf16(lane_a[lane][31:0])};
+                            lane_result_type[lane] = DT_BF16;
+                            lane_write[lane] = 1'b1;
+                        end else if ((lane_dtype[lane] == DT_F32) &&
+                                     (operand_a[lane][131:128] == DT_BF16)) begin
+                            lane_result[lane] = {96'b0, bf16_to_f32(lane_a[lane][15:0])};
+                            lane_result_type[lane] = DT_F32;
+                            lane_write[lane] = 1'b1;
+                        end
+                    end
                     OP_ADD, OP_SUB, OP_MUL, OP_MAC,
                     OP_AND, OP_OR, OP_XOR, OP_SHL, OP_SHR,
                     OP_MIN, OP_MAX, OP_SEL: begin
@@ -948,7 +1179,16 @@ module grider_tile #(
                                 OP_ADD: lane_result[lane] = {112'b0, bf16_add(lane_a[lane][15:0], lane_b[lane][15:0])};
                                 OP_SUB: lane_result[lane] = {112'b0, bf16_add(lane_a[lane][15:0], {~lane_b[lane][15], lane_b[lane][14:0]})};
                                 OP_MUL: lane_result[lane] = {112'b0, bf16_mul(lane_a[lane][15:0], lane_b[lane][15:0])};
-                                OP_MAC: lane_result[lane] = {112'b0, bf16_add(lane_acc[lane][15:0], bf16_mul(lane_a[lane][15:0], lane_b[lane][15:0]))};
+                                OP_MAC: begin
+                                    lane_result[lane] = {96'b0,
+                                        f32_add(
+                                            (operand_acc[lane][131:128] == DT_F32) ?
+                                                operand_acc[lane][31:0] :
+                                                bf16_to_f32(operand_acc[lane][15:0]),
+                                            f32_mul(bf16_to_f32(lane_a[lane][15:0]),
+                                                    bf16_to_f32(lane_b[lane][15:0])))};
+                                    lane_result_type[lane] = DT_F32;
+                                end
                                 OP_MIN: begin
                                     if (((lane_a[lane][14:7] == 8'hff) && (lane_a[lane][6:0] != 0)) ||
                                         ((lane_b[lane][14:7] == 8'hff) && (lane_b[lane][6:0] != 0)))
@@ -990,7 +1230,9 @@ module grider_tile #(
                             endcase
                             lane_result[lane] = truncate_by_type(lane_result[lane], lane_dtype[lane]);
                         end
-                        lane_result_type[lane] = lane_dtype[lane];
+                        if (!((instruction_opcode_q == OP_MAC) &&
+                              (lane_dtype[lane] == DT_BF16)))
+                            lane_result_type[lane] = lane_dtype[lane];
                         lane_write[lane] = 1'b1;
                     end
                     OP_NEIGHBOR: begin
