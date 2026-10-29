@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Grider
 
 Grider is an experimental cellular SIMD processor. It places 16×16-cell compute tiles in a two-dimensional mesh. One instruction is decoded per tile and broadcast to all 256 cells; each cell has its own ALU/MAC, register file, local SRAM, and no instruction decoder.
@@ -42,3 +44,10 @@ python -m grider.verify_mesh_rtl
 The tile check compares all 8,192 register/SRAM words across 256 cells after the same instruction stream, including BF16 edge cases and row reductions. The mesh check covers all eight halo directions in a 2×2 mesh. GitHub Actions runs the unit tests, RTL comparisons and examples.
 
 See [docs/architecture.md](docs/architecture.md), [rtl/grider_tile.sv](rtl/grider_tile.sv), and [rtl/grider_mesh.sv](rtl/grider_mesh.sv).
+
+## License
+
+Grider RTL and hardware design documents use CERN-OHL-W-2.0. The Python
+emulator, tests, development tools, and other project files use Apache-2.0.
+See [LICENSE.md](LICENSE.md) for the file scope, third-party notices, and
+distribution guidance.

@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: CERN-OHL-W-2.0 -->
+
 # Grider v0.1 instruction semantics
 
 This document defines the architectural behavior shared by the Python model and the RTL. Version 0.1 adds row reductions at opcodes 18 and 19; all other v0 encodings retain their behavior. The Python `Tile.step` API represents an already accepted instruction; it does not model host-port backpressure timing.

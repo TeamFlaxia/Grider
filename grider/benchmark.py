@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Run small Grider SIMD kernels and estimate throughput from the RTL latency.
 
 The Python tile is functional, not cycle accurate. The cycle counts below come

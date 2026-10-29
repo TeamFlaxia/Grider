@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Small dense matrix multiplication reference example."""
 
 from grider.kernels import matmul

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Broadcast a vector add across all 256 cells."""
 
 from grider import DataType, Instruction, Opcode, Tile
