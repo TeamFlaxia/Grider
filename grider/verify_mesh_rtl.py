@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Compare Python and RTL for a 2×2 mesh, including all 8 halo directions."""
 
 from __future__ import annotations

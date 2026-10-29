@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 set sky130hd_platform /OpenROAD-flow-scripts/flow/platforms/sky130hd
 set macro_dir build/sky130hd/sram22
 set data_macro_dir $macro_dir/sram22_64x128m4w8

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Layer normalization reference example."""
 
 from grider.kernels import layer_norm

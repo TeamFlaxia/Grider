@@ -1,7 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+
 __pycache__/
 *.py[cod]
 .venv/
 .tools/
 build/
+# Generated simulator outputs
+*.vvp
+*.vcd
+*.fst
 dist/
 *.egg-info/

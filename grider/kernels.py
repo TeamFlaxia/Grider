@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Dependency-free reference implementations for common AI kernels.
 
 These are algorithmic oracles for kernel mappings. They use Python lists and

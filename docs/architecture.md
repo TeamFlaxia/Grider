@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: CERN-OHL-W-2.0 -->
+
 # Grider architecture
 
 ## Organization

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Compare the Python tile emulator with the SystemVerilog tile via Icarus.
 
 Run from the repository root with `python -m grider.verify_rtl`. The check uses

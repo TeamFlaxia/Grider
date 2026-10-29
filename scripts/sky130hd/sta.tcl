@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 set sky130hd_platform /OpenROAD-flow-scripts/flow/platforms/sky130hd
 read_lef -tech $sky130hd_platform/lef/sky130_fd_sc_hd.tlef
 read_lef -library $sky130hd_platform/lef/sky130_fd_sc_hd_merged.lef
