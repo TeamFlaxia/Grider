@@ -12,7 +12,7 @@ against `gemm16`. `python -m grider.verify_gemm_rtl` sends the same generated
 instructions through `tb_grider_tile.sv` and compares the RTL output register
 with the Python model.
 
-This lowering embeds matrix values in `MOVI` immediates. It demonstrates a
+NaN results from BF16 MAC are canonicalized to the positive binary32 quiet NaN `0x7fc00000` in both the Python model and RTL.\n\nThis lowering embeds matrix values in `MOVI` immediates. It demonstrates a
 complete reference-to-ISA-to-tile path while the repository has no host-memory
 load instruction or program fetch unit. A reusable kernel with runtime matrix
 inputs and transfer scheduling remains future work.
