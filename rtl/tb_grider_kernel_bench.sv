@@ -114,6 +114,25 @@ module tb_grider_kernel_bench;
         end
     endtask
 
+    task automatic check_f32(input [3:0] index, input [31:0] expected);
+        begin
+            @(negedge clk);
+            host_memory_select = 1'b0;
+            host_lane = 8'd0;
+            host_index = index;
+            host_read_enable = 1'b1;
+            if (host_access_ready !== 1'b1)
+                $fatal(1, "F32 host read was not ready");
+            @(posedge clk); #1;
+            if (host_read_valid !== 1'b1)
+                $fatal(1, "F32 host read did not return valid");
+            if ((host_read_data[31:0] !== expected) || (host_read_type !== 4'd8))
+                $fatal(1, "F32 mismatch r%0d: got %h type %h expected %h",
+                       index, host_read_data[31:0], host_read_type, expected);
+            host_read_enable = 1'b0;
+        end
+    endtask
+
     initial begin
         repeat (2) @(posedge clk);
         @(negedge clk); rst_n = 1'b1; #1;
@@ -148,7 +167,9 @@ module tb_grider_kernel_bench;
             if (cycles != 5) $fatal(1, "BF16 MAC expected 5 cycles, got %0d", cycles);
             mac_cycles = mac_cycles + cycles;
         end
-        check_bf16(4'd0, 16'h4242); // 48.5
+        check_f32(4'd0, 32'h42420000); // F32 accumulator = 48.5
+        run_bf16(5'd20, 4'd0, 4'd0, 4'd0, 128'd0, cycles); // CONVERT F32 to BF16
+        check_bf16(4'd0, 16'h4242); // 48.5 rounded to BF16
 
         add_mflops_20mhz = 20.0 * ITERATIONS / add_cycles;
         mul_mflops_20mhz = 20.0 * ITERATIONS / mul_cycles;
