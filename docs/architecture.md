@@ -22,10 +22,11 @@ Neighbor direction is N, NE, E, SE, S, SW, W, NW (0–7). Tile and cell indices 
 | `I16`, `I32`, `I64` | signed integer | wraps to selected width |
 | `U128` | unsigned 128-bit vector | payload bit operations |
 | `PRED` | predicate | low bit, nonzero means true |
+| `F32` | IEEE-754 binary32 | BF16 MAC accumulator storage; converted explicitly to/from BF16 |
 
-Opcodes 0–19 are defined in [ISA v0.1](isa.md). They include MOV/MOVI, arithmetic, bitwise operations, shifts, MIN/MAX/SEL, NEIGHBOR, LOAD/STORE, and row reductions. Reserved opcodes and type tags are no-ops.
+Opcodes 0–20 are defined in [ISA v0.2](isa.md). They include MOV/MOVI, arithmetic, bitwise operations, shifts, MIN/MAX/SEL, NEIGHBOR, LOAD/STORE, row reductions, and BF16/F32 conversion. Reserved opcodes and type tags are no-ops.
 
-BF16 MAC rounds the product to BF16, adds it to the accumulator, then rounds the sum. BF16 row sum rounds at each tree node. BF16 max returns canonical quiet NaN if a participating input is NaN.
+BF16 MAC stores its accumulator in F32, preserving FP32 precision across a reduction loop. The first MAC accepts an existing BF16 accumulator; subsequent MACs consume the F32 result. `CONVERT` rounds the final F32 result to BF16. BF16 row sum rounds at each tree node. BF16 max returns canonical quiet NaN if a participating input is NaN.
 
 ## Reduction behavior
 

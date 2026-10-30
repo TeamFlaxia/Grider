@@ -30,6 +30,7 @@ class DataType(IntEnum):
     I64 = 0x5
     U128 = 0x6
     PRED = 0x7
+    F32 = 0x8
 
 
 class Opcode(IntEnum):
@@ -53,6 +54,7 @@ class Opcode(IntEnum):
     STORE = 17
     REDUCE_SUM = 18
     REDUCE_MAX = 19
+    CONVERT = 20
 
 
 @dataclass(frozen=True)
@@ -90,7 +92,7 @@ class _Register:
 def _width(dtype: DataType) -> int:
     return {DataType.I4: 4, DataType.I8: 8, DataType.I16: 16,
             DataType.I32: 32, DataType.I64: 64, DataType.BF16: 16,
-            DataType.PRED: 1, DataType.U128: 128}[dtype]
+            DataType.PRED: 1, DataType.U128: 128, DataType.F32: 32}[dtype]
 
 
 def _signed(value: int, width: int) -> int:
@@ -102,6 +104,8 @@ def _signed(value: int, width: int) -> int:
 def _pack(value: int, dtype: DataType) -> int:
     if dtype == DataType.BF16:
         return value & 0xFFFF
+    if dtype == DataType.F32:
+        return value & 0xFFFFFFFF
     return value & ((1 << _width(dtype)) - 1)
 
 
@@ -117,6 +121,10 @@ _NUMERIC_OPS = frozenset({
 
 def _supports_dtype(op: Opcode, dtype: DataType) -> bool:
     """Return whether the v0 ISA defines this arithmetic/type combination."""
+    if op == Opcode.CONVERT:
+        return dtype in (DataType.BF16, DataType.F32)
+    if op == Opcode.MAC and dtype == DataType.BF16:
+        return True
     return op not in _NUMERIC_OPS or dtype in _NUMERIC_DTYPES
 
 
@@ -139,10 +147,32 @@ def bf16_to_float(value: int) -> float:
     return struct.unpack(">f", struct.pack(">I", (value & 0xFFFF) << 16))[0]
 
 
+def float_to_f32(value: float) -> int:
+    """Return the IEEE-754 binary32 bit pattern for value."""
+    try:
+        return struct.unpack(">I", struct.pack(">f", float(value)))[0]
+    except OverflowError:
+        return 0xFF800000 if value < 0 else 0x7F800000
+
+
+def _f32_arithmetic_bits(value: float) -> int:
+    """Match the RTL's canonical quiet NaN for arithmetic results."""
+    bits = float_to_f32(value)
+    if (bits & 0x7F800000) == 0x7F800000 and (bits & 0x007FFFFF):
+        return 0x7FC00000
+    return bits
+
+
+def f32_to_float(value: int) -> float:
+    return struct.unpack(">f", struct.pack(">I", value & 0xFFFFFFFF))[0]
+
+
 def _decode(reg: _Register, dtype: DataType | None = None) -> int | float:
     kind = dtype if dtype is not None else reg.dtype
     if kind == DataType.BF16:
         return bf16_to_float(reg.payload)
+    if kind == DataType.F32:
+        return f32_to_float(reg.payload)
     if kind == DataType.U128:
         return reg.payload & MASK128
     if kind == DataType.PRED:
@@ -179,7 +209,8 @@ class Tile:
         if not 0 <= register < REGISTERS or len(values) != LANES:
             raise ValueError("expected a valid register and exactly 256 values")
         for lane, value in enumerate(values):
-            payload = float_to_bf16(value) if dtype == DataType.BF16 else _pack(int(value), dtype)
+            payload = (float_to_bf16(value) if dtype == DataType.BF16 else
+                       float_to_f32(value) if dtype == DataType.F32 else _pack(int(value), dtype))
             self._rf[lane][register] = _Register(payload, dtype)
 
     def read_register(self, register: int, *, decoded: bool = True) -> list[int | float]:
@@ -206,7 +237,8 @@ class Tile:
         if not 0 <= address < LOCAL_WORDS or len(values) != LANES:
             raise ValueError("expected a valid SRAM word and exactly 256 values")
         for lane, value in enumerate(values):
-            payload = float_to_bf16(value) if dtype == DataType.BF16 else _pack(int(value), dtype)
+            payload = (float_to_bf16(value) if dtype == DataType.BF16 else
+                       float_to_f32(value) if dtype == DataType.F32 else _pack(int(value), dtype))
             self._sram[lane][address] = _Register(payload, dtype)
 
     def read_sram(self, address: int, lane: int, *, decoded: bool = True) -> int | float:
@@ -328,6 +360,19 @@ class Tile:
                 payload = _pack(immediate, out_type)
                 writes.append((lane, _Register(payload, out_type)))
                 continue
+            if op == Opcode.CONVERT:
+                if not ((a.dtype == DataType.F32 and out_type == DataType.BF16) or
+                        (a.dtype == DataType.BF16 and out_type == DataType.F32)):
+                    continue
+                value = _decode(a)
+                if out_type == DataType.BF16:
+                    payload = float_to_bf16(float(value))
+                elif out_type == DataType.F32:
+                    payload = float_to_f32(float(value))
+                else:
+                    continue
+                writes.append((lane, _Register(payload, out_type)))
+                continue
             if op == Opcode.SEL:
                 selected = b if a.payload != 0 else c
                 payload = _pack(selected.payload, out_type)
@@ -345,11 +390,14 @@ class Tile:
             elif op == Opcode.MUL:
                 result = av * bv
             elif op == Opcode.MAC:
-                old = _decode(self._rf[lane][insn.dst], out_type)
-                product = av * bv
+                accumulator = self._rf[lane][insn.dst]
                 if out_type == DataType.BF16:
-                    product = bf16_to_float(float_to_bf16(product))
-                result = old + product
+                    old = _decode(accumulator, DataType.F32 if accumulator.dtype == DataType.F32 else DataType.BF16)
+                    result_bits = _f32_arithmetic_bits(float(old) + float(av) * float(bv))
+                    writes.append((lane, _Register(result_bits, DataType.F32)))
+                    continue
+                old = _decode(accumulator, out_type)
+                result = old + av * bv
             elif op == Opcode.AND:
                 result = a.payload & b.payload
             elif op == Opcode.OR:
@@ -373,7 +421,9 @@ class Tile:
                 # Unknown v0 opcodes are defined as no-ops above.
                 continue
 
-            payload = float_to_bf16(float(result)) if out_type == DataType.BF16 else _pack(int(result), out_type)
+            payload = (float_to_bf16(float(result)) if out_type == DataType.BF16 else
+                       float_to_f32(float(result)) if out_type == DataType.F32 else
+                       _pack(int(result), out_type))
             writes.append((lane, _Register(payload, out_type)))
 
         for lane, value in writes:
@@ -449,7 +499,7 @@ def gemm16(a: Sequence[Sequence[int | float]], b: Sequence[Sequence[int | float]
     """Reference 16×16 GEMM for a tile's 256 output cells.
 
     INT4/INT8 accumulate into signed INT32 results. BF16 inputs accumulate in
-    Python float and are rounded to BF16 after each product sum (one final round).
+    IEEE binary32 and are rounded to BF16 once at output.
     This is a functional reference, not a cycle-accurate microkernel.
     """
     if len(a) != 16 or len(b) != 16 or any(len(row) != 16 for row in a) or any(len(row) != 16 for row in b):
@@ -469,7 +519,10 @@ def gemm16(a: Sequence[Sequence[int | float]], b: Sequence[Sequence[int | float]
                     width = _width(dtype)
                     av = _signed(int(a[row][k]), width)
                     bv = _signed(int(b[k][col]), width)
-                acc += av * bv
+                if dtype == DataType.BF16:
+                    acc = f32_to_float(_f32_arithmetic_bits(float(acc) + av * bv))
+                else:
+                    acc += av * bv
             output_row.append(bf16_to_float(float_to_bf16(float(acc))) if dtype == DataType.BF16 else _signed(int(acc), 32))
         result.append(output_row)
     return result

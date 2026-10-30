@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: CERN-OHL-W-2.0
+// SPDX-License-Identifier: CERN-OHL-W-2.0
 
 `timescale 1ns/1ps
 module tb_grider_tile;

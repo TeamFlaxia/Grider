@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: CERN-OHL-W-2.0
+// SPDX-License-Identifier: CERN-OHL-W-2.0
 
 // Two-dimensional mesh of lockstep SIMD tiles. Instructions are broadcast to
 // every tile; tile-edge registers provide one-cycle eight-neighbor halo reads.
