@@ -153,6 +153,14 @@ def float_to_f32(value: float) -> int:
         return 0xFF800000 if value < 0 else 0x7F800000
 
 
+def _f32_arithmetic_bits(value: float) -> int:
+    """Match the RTL's canonical quiet NaN for arithmetic results."""
+    bits = float_to_f32(value)
+    if (bits & 0x7F800000) == 0x7F800000 and (bits & 0x007FFFFF):
+        return 0x7FC00000
+    return bits
+
+
 def f32_to_float(value: int) -> float:
     return struct.unpack(">f", struct.pack(">I", value & 0xFFFFFFFF))[0]
 
@@ -383,8 +391,8 @@ class Tile:
                 accumulator = self._rf[lane][insn.dst]
                 if out_type == DataType.BF16:
                     old = _decode(accumulator, DataType.F32 if accumulator.dtype == DataType.F32 else DataType.BF16)
-                    result = f32_to_float(float_to_f32(float(old) + float(av) * float(bv)))
-                    writes.append((lane, _Register(float_to_f32(result), DataType.F32)))
+                    result_bits = _f32_arithmetic_bits(float(old) + float(av) * float(bv))
+                    writes.append((lane, _Register(result_bits, DataType.F32)))
                     continue
                 old = _decode(accumulator, out_type)
                 result = old + av * bv
@@ -510,7 +518,7 @@ def gemm16(a: Sequence[Sequence[int | float]], b: Sequence[Sequence[int | float]
                     av = _signed(int(a[row][k]), width)
                     bv = _signed(int(b[k][col]), width)
                 if dtype == DataType.BF16:
-                    acc = f32_to_float(float_to_f32(float(acc) + av * bv))
+                    acc = f32_to_float(_f32_arithmetic_bits(float(acc) + av * bv))
                 else:
                     acc += av * bv
             output_row.append(bf16_to_float(float_to_bf16(float(acc))) if dtype == DataType.BF16 else _signed(int(acc), 32))
