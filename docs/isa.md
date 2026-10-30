@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: CERN-OHL-W-2.0 -->
+
 # Grider v0.2 instruction semantics
 
 This document defines the architectural behavior shared by the Python model and the RTL. Version 0.2 adds FP32 accumulation for BF16 MAC and an explicit BF16/FP32 conversion at opcode 20. Version 0.1 added row reductions at opcodes 18 and 19. The Python `Tile.step` API represents an already accepted instruction; it does not model host-port backpressure timing.
