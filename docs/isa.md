@@ -49,7 +49,7 @@ Register and SRAM payloads are 128 bits with a four-bit type tag. Typed scalar p
 | U128 | All 128 bits |
 | F32 | Low 32 bits, IEEE-754 binary32 |
 
-Signed integer arithmetic interprets the selected width as two's complement and wraps modulo that width. BF16 arithmetic rounds to nearest, ties to even. For a BF16 `MAC`, `src_a` and `src_b` are BF16 values and `dst` is the accumulator. The first MAC treats a non-F32 destination as a BF16 accumulator; the result is stored as F32. Later MACs read that F32 accumulator and preserve its precision. Use `CONVERT` with dtype BF16 after the final MAC to round the accumulated value to BF16.
+Signed integer arithmetic interprets the selected width as two's complement and wraps modulo that width. BF16 arithmetic rounds to nearest, ties to even. For a BF16 `MAC`, `src_a` and `src_b` are BF16 values and `dst` is the accumulator. The first MAC treats a non-F32 destination as a BF16 accumulator; the result is stored as F32. Later MACs read that F32 accumulator and preserve its precision. Use `CONVERT` with dtype BF16 after the final MAC to round the accumulated value to BF16. NaN results from BF16 MAC are stored as the canonical positive binary32 quiet NaN `0x7fc00000`; NaN sign and payload are not preserved.
 
 ## Type selection
 
