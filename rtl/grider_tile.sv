@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: CERN-OHL-W-2.0
+
 // Grider v0 tile datapath.
 // One decoder issues a single in-flight instruction to lockstep cells. Each
 // cell uses synchronous single-port memories; operand reads, execution and

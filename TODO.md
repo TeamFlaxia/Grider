@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Grider TODO
 
 最終更新: 2026-10-26

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Small, dependency-free functional model of a Grider 16x16 tile.
 
 The model treats a typed register as a 128-bit payload plus a four-bit tag.

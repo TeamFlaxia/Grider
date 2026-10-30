@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: CERN-OHL-W-2.0
+
 `timescale 1ns/1ps
 module tb_grider_mesh;
     localparam integer TILES_X = 2;
