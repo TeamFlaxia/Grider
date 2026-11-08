@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import tempfile
 
-from .sim import DataType, Instruction, Opcode, Tile, bf16_to_float
+from .sim import DataType, Instruction, Opcode, Tile, bf16_to_float, f32_to_float, float_to_f32
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,7 +25,8 @@ ALL_LANES = (1 << LANES) - 1
 
 
 def _stimulus(tile: Tile, integer_program: list[Instruction],
-              bf16_program: list[Instruction]) -> str:
+              bf16_program: list[Instruction],
+              f32_program: list[Instruction] | None = None) -> str:
     lines: list[str] = []
 
     def write(kind: str, lane: int, index: int, payload: int, dtype: DataType) -> None:
@@ -89,6 +90,24 @@ def _stimulus(tile: Tile, integer_program: list[Instruction],
             write("R", lane, register, payload, tag)
 
     run(bf16_program)
+
+    if f32_program:
+        f32_directed = {
+            8: [0.0, -0.0, 1.0, -1.0, 1.5, -1.5, 0.5, 2.0, 100.0, 0.001,
+                3.1415925, -2.71828, 1e10, 1e-10, 1e20, 1e-20,
+                float("inf"), float("-inf"), 0.0, -0.0, 0.5, -0.5],
+            9: [0.0, 0.0, 1.0, 1.0, -1.5, 2.25, -0.5, 0.5, -100.0, 1000.0,
+                0.001, -0.001, 2.0, 3.0, -1e10, 1e10,
+                1.0, -1.0, 2.0, 3.0, float("inf"), float("-inf")],
+        }
+        for register, pattern in f32_directed.items():
+            values = list(pattern)
+            while len(values) < LANES:
+                values.append(f32_to_float(float_to_f32(rng.uniform(-10.0, 10.0))))
+            tile.load_register(register, values, DataType.F32)
+            for lane, (payload, tag) in enumerate(tile.read_register_raw(register)):
+                write("R", lane, register, payload, tag)
+        run(f32_program)
     return "\n".join(lines) + "\n"
 
 
@@ -125,6 +144,22 @@ def _program() -> list[Instruction]:
         Instruction(Opcode.REDUCE_MAX, dst=7, src_a=0, dtype=DataType.I8,
                     lane_mask=reduction_mask),
         Instruction(Opcode.MOVI, dst=1, imm=0x80, dtype=DataType.I8),
+        # v0.3 dataflow extensions.
+        Instruction(Opcode.TRANSPOSE, dst=10, src_a=0, imm=0),
+        Instruction(Opcode.TRANSPOSE, dst=11, src_a=0, imm=3),
+        Instruction(Opcode.REDUCE_SUM_COL, dst=12, src_a=0, dtype=DataType.I8),
+        Instruction(Opcode.REDUCE_MAX_COL, dst=13, src_a=0, dtype=DataType.I8),
+        Instruction(Opcode.SCAN_SUM, dst=14, src_a=0, dtype=DataType.I8),
+        Instruction(Opcode.DOT_ROW, dst=15, src_a=0, src_b=1, dtype=DataType.I8),
+        Instruction(Opcode.DIV, dst=4, src_a=0, src_b=1, dtype=DataType.I8),
+        Instruction(Opcode.ROW_BROADCAST, dst=5, src_a=0),
+        Instruction(Opcode.COL_BROADCAST, dst=6, src_a=0),
+        Instruction(Opcode.STORE, src_a=0, imm=2),
+        Instruction(Opcode.MOVI, dst=2, imm=2, dtype=DataType.I8),
+        Instruction(Opcode.GATHER, dst=7, src_a=2),
+        Instruction(Opcode.MOVI, dst=3, imm=5, dtype=DataType.I8),
+        Instruction(Opcode.SCATTER, src_a=0, src_b=3),
+        Instruction(Opcode.GATHER, dst=8, src_a=3),
     ]
 
 
@@ -138,6 +173,27 @@ def _bf16_program() -> list[Instruction]:
         Instruction(Opcode.MAX, dst=9, src_a=0, src_b=1, dtype=DataType.BF16),
         Instruction(Opcode.REDUCE_SUM, dst=10, src_a=0, dtype=DataType.BF16),
         Instruction(Opcode.REDUCE_MAX, dst=11, src_a=1, dtype=DataType.BF16),
+        Instruction(Opcode.REDUCE_SUM_COL, dst=12, src_a=0, dtype=DataType.BF16),
+        Instruction(Opcode.REDUCE_MAX_COL, dst=13, src_a=0, dtype=DataType.BF16),
+        Instruction(Opcode.SCAN_SUM, dst=14, src_a=0, dtype=DataType.BF16),
+        Instruction(Opcode.DOT_ROW, dst=15, src_a=0, src_b=1, dtype=DataType.BF16),
+        Instruction(Opcode.TRANSPOSE, dst=10, src_a=0, imm=1),
+    ]
+
+
+def _f32_program() -> list[Instruction]:
+    return [
+        Instruction(Opcode.ADD, dst=2, src_a=8, src_b=9, dtype=DataType.F32),
+        Instruction(Opcode.SUB, dst=3, src_a=8, src_b=9, dtype=DataType.F32),
+        Instruction(Opcode.MUL, dst=4, src_a=8, src_b=9, dtype=DataType.F32),
+        Instruction(Opcode.MAC, dst=4, src_a=8, src_b=9, dtype=DataType.F32),
+        Instruction(Opcode.MIN, dst=5, src_a=8, src_b=9, dtype=DataType.F32),
+        Instruction(Opcode.MAX, dst=6, src_a=8, src_b=9, dtype=DataType.F32),
+        Instruction(Opcode.REDUCE_SUM, dst=7, src_a=8, dtype=DataType.F32),
+        Instruction(Opcode.REDUCE_MAX, dst=10, src_a=8, dtype=DataType.F32),
+        Instruction(Opcode.REDUCE_SUM_COL, dst=11, src_a=8, dtype=DataType.F32),
+        Instruction(Opcode.SCAN_SUM, dst=12, src_a=8, dtype=DataType.F32),
+        Instruction(Opcode.DOT_ROW, dst=13, src_a=8, src_b=9, dtype=DataType.F32),
     ]
 
 
@@ -161,8 +217,9 @@ def verify() -> tuple[int, int]:
     tile = Tile()
     integer_program = _program()
     bf16_program = _bf16_program()
-    program = integer_program + bf16_program
-    stimulus = _stimulus(tile, integer_program, bf16_program)
+    f32_program = _f32_program()
+    program = integer_program + bf16_program + f32_program
+    stimulus = _stimulus(tile, integer_program, bf16_program, f32_program)
     expected = _expected(tile)
     tb = ROOT / "rtl" / "tb_grider_tile.sv"
     rtl = ROOT / "rtl" / "grider_tile.sv"

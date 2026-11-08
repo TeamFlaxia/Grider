@@ -83,6 +83,16 @@ module grider_tile #(
     localparam logic [4:0] OP_REDUCE_SUM = 5'd18;
     localparam logic [4:0] OP_REDUCE_MAX = 5'd19;
     localparam logic [4:0] OP_CONVERT = 5'd20;
+    localparam logic [4:0] OP_TRANSPOSE = 5'd21;
+    localparam logic [4:0] OP_REDUCE_SUM_COL = 5'd22;
+    localparam logic [4:0] OP_REDUCE_MAX_COL = 5'd23;
+    localparam logic [4:0] OP_SCAN_SUM = 5'd24;
+    localparam logic [4:0] OP_GATHER = 5'd25;
+    localparam logic [4:0] OP_SCATTER = 5'd26;
+    localparam logic [4:0] OP_ROW_BROADCAST = 5'd27;
+    localparam logic [4:0] OP_COL_BROADCAST = 5'd28;
+    localparam logic [4:0] OP_DIV = 5'd29;
+    localparam logic [4:0] OP_DOT_ROW = 5'd30;
 
     localparam logic [3:0] DT_I4 = 4'h0;
     localparam logic [3:0] DT_I8 = 4'h1;
@@ -113,9 +123,16 @@ module grider_tile #(
         begin
             case (operation)
                 OP_ADD, OP_SUB, OP_MUL, OP_MAC, OP_MIN, OP_MAX,
-                OP_REDUCE_SUM, OP_REDUCE_MAX:
+                OP_REDUCE_SUM, OP_REDUCE_MAX,
+                OP_REDUCE_SUM_COL, OP_REDUCE_MAX_COL,
+                OP_SCAN_SUM, OP_DOT_ROW:
                     opcode_supports_dtype =
                         (tag == DT_I4) || (tag == DT_I8) || (tag == DT_BF16) ||
+                        (tag == DT_I16) || (tag == DT_I32) || (tag == DT_I64) ||
+                        (tag == DT_F32);
+                OP_DIV:
+                    opcode_supports_dtype =
+                        (tag == DT_I4) || (tag == DT_I8) ||
                         (tag == DT_I16) || (tag == DT_I32) || (tag == DT_I64);
                 default: opcode_supports_dtype = 1'b1;
             endcase
@@ -131,7 +148,10 @@ module grider_tile #(
                 OP_MOV, OP_ADD, OP_SUB, OP_MUL, OP_MAC, OP_CONVERT,
                 OP_AND, OP_OR, OP_XOR, OP_SHL, OP_SHR,
                 OP_MIN, OP_MAX, OP_SEL, OP_NEIGHBOR, OP_STORE,
-                OP_REDUCE_SUM, OP_REDUCE_MAX:
+                OP_REDUCE_SUM, OP_REDUCE_MAX,
+                OP_TRANSPOSE, OP_REDUCE_SUM_COL, OP_REDUCE_MAX_COL,
+                OP_SCAN_SUM, OP_GATHER, OP_SCATTER,
+                OP_ROW_BROADCAST, OP_COL_BROADCAST, OP_DIV, OP_DOT_ROW:
                     operation_has_src_a = 1'b1;
                 OP_MOVI: operation_has_src_a = (type_tag == DT_INHERIT);
                 default: operation_has_src_a = 1'b0;
@@ -144,7 +164,8 @@ module grider_tile #(
             case (operation)
                 OP_ADD, OP_SUB, OP_MUL, OP_MAC,
                 OP_AND, OP_OR, OP_XOR, OP_SHL, OP_SHR,
-                OP_MIN, OP_MAX, OP_SEL:
+                OP_MIN, OP_MAX, OP_SEL,
+                OP_SCATTER, OP_DIV, OP_DOT_ROW:
                     operation_has_src_b = 1'b1;
                 default: operation_has_src_b = 1'b0;
             endcase
@@ -186,6 +207,31 @@ module grider_tile #(
         end
     endfunction
 
+    function automatic integer tile_permute_lane(
+        input integer dst_lane,
+        input logic [2:0] kind
+    );
+        integer px;
+        integer py;
+        integer sx;
+        integer sy;
+        begin
+            px = dst_lane % TILE_W;
+            py = dst_lane / TILE_W;
+            case (kind)
+                3'd0: begin sx = py;         sy = px; end
+                3'd1: begin sx = TILE_W-1-px; sy = py; end
+                3'd2: begin sx = px;         sy = TILE_H-1-py; end
+                3'd3: begin sx = py;         sy = TILE_H-1-px; end
+                3'd4: begin sx = TILE_W-1-py; sy = px; end
+                3'd5: begin sx = TILE_W-1-py; sy = TILE_H-1-px; end
+                3'd6: begin sx = TILE_W-1-px; sy = TILE_H-1-py; end
+                default: begin sx = px;      sy = py; end
+            endcase
+            tile_permute_lane = sy * TILE_W + sx;
+        end
+    endfunction
+
     localparam integer REDUCE_STAGES = (TILE_W > 1) ? $clog2(TILE_W) : 1;
 
     localparam logic [2:0] ST_IDLE      = 3'd0;
@@ -195,6 +241,7 @@ module grider_tile #(
     localparam logic [2:0] ST_WAIT_LOAD = 3'd4;
     localparam logic [2:0] ST_EXEC      = 3'd5;
     localparam logic [2:0] ST_WB        = 3'd6;
+    localparam logic [2:0] ST_WAIT_GATHER = 3'd7;
 
     logic [2:0] state;
     logic [4:0] instruction_opcode_q;
@@ -243,6 +290,12 @@ module grider_tile #(
     logic [3:0]   lane_dtype [0:LANES-1];
     logic [127:0] row_reduction [0:TILE_H-1];
     logic [3:0]   row_reduction_type [0:TILE_H-1];
+    logic [127:0] col_reduction [0:TILE_W-1];
+    logic [3:0]   col_reduction_type [0:TILE_W-1];
+    logic [127:0] scan_result [0:LANES-1];
+    logic [3:0]   scan_type [0:TILE_H-1];
+    logic [127:0] dot_result [0:TILE_H-1];
+    logic [3:0]   dot_type [0:TILE_H-1];
     logic signed [127:0] signed_a;
     logic signed [127:0] signed_b;
     logic signed [127:0] signed_min_a;
@@ -267,6 +320,37 @@ module grider_tile #(
     logic [127:0] reduce_sum_value;
     logic signed [127:0] reduce_left_value;
     logic signed [127:0] reduce_right_value;
+    logic [127:0] col_partial [0:TILE_H-1];
+    logic [TILE_H-1:0] col_valid;
+    logic [3:0] col_type_work;
+    logic col_has_nan;
+    logic [127:0] col_sum_value;
+    logic signed [127:0] col_left_value;
+    logic signed [127:0] col_right_value;
+    logic found_active_col;
+    integer scan_y;
+    integer scan_x;
+    logic [127:0] scan_running;
+    logic scan_has;
+    logic [3:0] scan_type_work;
+    logic signed [127:0] scan_prior;
+    logic signed [127:0] scan_cur;
+    integer dot_y;
+    integer dot_x;
+    logic [31:0] dot_acc;
+    logic [127:0] dot_acc_wide;
+    logic [3:0] dot_type_work;
+    logic dot_has;
+    logic [31:0] dot_prod;
+    integer perm_x;
+    integer perm_y;
+    integer perm_sx;
+    integer perm_sy;
+    integer perm_src;
+    integer bc_lane;
+    integer col_stage;
+    integer col_stride;
+    integer col_col;
 
 
     // A host transaction uses a memory port only while the instruction engine is idle.
@@ -678,6 +762,22 @@ module grider_tile #(
         end
     endfunction
 
+    function automatic logic f32_less_than(
+        input logic [31:0] a_value,
+        input logic [31:0] b_value
+    );
+        logic a_zero;
+        logic b_zero;
+        begin
+            a_zero = (a_value[30:0] == 0);
+            b_zero = (b_value[30:0] == 0);
+            if (a_zero && b_zero) f32_less_than = 1'b0;
+            else if (a_value[31] != b_value[31]) f32_less_than = a_value[31];
+            else if (a_value[31]) f32_less_than = (a_value[30:0] > b_value[30:0]);
+            else f32_less_than = (a_value[30:0] < b_value[30:0]);
+        end
+    endfunction
+
     function automatic logic [31:0] bf16_to_f32(input logic [15:0] value);
         begin
             bf16_to_f32 = {value, 16'b0};
@@ -951,6 +1051,10 @@ module grider_tile #(
                         (reduce_partial[reduce_x][14:7] == 8'hff) &&
                         (reduce_partial[reduce_x][6:0] != 0))
                         reduce_has_nan = 1'b1;
+                    if ((reduce_type_work == DT_F32) && reduce_valid[reduce_x] &&
+                        (reduce_partial[reduce_x][30:23] == 8'hff) &&
+                        (reduce_partial[reduce_x][22:0] != 0))
+                        reduce_has_nan = 1'b1;
                 end
 
                 for (reduce_stage = 0; reduce_stage < REDUCE_STAGES; reduce_stage = reduce_stage + 1) begin
@@ -964,6 +1068,10 @@ module grider_tile #(
                                         reduce_partial[reduce_col] = {112'b0,
                                             bf16_add(reduce_partial[reduce_col][15:0],
                                                      reduce_partial[reduce_col+reduce_stride][15:0])};
+                                    end else if (reduce_type_work == DT_F32) begin
+                                        reduce_partial[reduce_col] = {96'b0,
+                                            f32_add(reduce_partial[reduce_col][31:0],
+                                                    reduce_partial[reduce_col+reduce_stride][31:0])};
                                     end else begin
                                         reduce_sum_value =
                                             $signed(sign_extend_by_type(reduce_partial[reduce_col], reduce_type_work)) +
@@ -982,6 +1090,18 @@ module grider_tile #(
                                         end else if (bf16_less_than(
                                             reduce_partial[reduce_col][15:0],
                                             reduce_partial[reduce_col+reduce_stride][15:0])) begin
+                                            reduce_partial[reduce_col] = reduce_partial[reduce_col+reduce_stride];
+                                        end
+                                    end else if (reduce_type_work == DT_F32) begin
+                                        if (((reduce_partial[reduce_col][30:23] == 8'hff) &&
+                                             (reduce_partial[reduce_col][22:0] != 0)) ||
+                                            ((reduce_partial[reduce_col+reduce_stride][30:23] == 8'hff) &&
+                                             (reduce_partial[reduce_col+reduce_stride][22:0] != 0))) begin
+                                            reduce_partial[reduce_col] = {96'b0, 32'h7fc00000};
+                                            reduce_has_nan = 1'b1;
+                                        end else if (f32_less_than(
+                                            reduce_partial[reduce_col][31:0],
+                                            reduce_partial[reduce_col+reduce_stride][31:0])) begin
                                             reduce_partial[reduce_col] = reduce_partial[reduce_col+reduce_stride];
                                         end
                                     end else begin
@@ -1006,12 +1126,253 @@ module grider_tile #(
                     (instruction_opcode_q == OP_REDUCE_MAX)) begin
                     if (reduce_has_nan && (reduce_type_work == DT_BF16))
                         row_reduction[reduce_y] = {112'b0, 16'h7fc0};
+                    else if (reduce_has_nan && (reduce_type_work == DT_F32))
+                        row_reduction[reduce_y] = {96'b0, 32'h7fc00000};
                     else if (reduce_valid[0])
                         row_reduction[reduce_y] =
                             truncate_by_type(reduce_partial[0], reduce_type_work);
                 end
             end
         end
+        end
+    end
+
+    always_comb begin
+        for (scan_y = 0; scan_y < TILE_H; scan_y = scan_y + 1) begin
+            scan_type[scan_y] = DT_I32;
+            col_reduction[scan_y < TILE_W ? scan_y : 0] = '0;
+            dot_result[scan_y] = '0;
+            dot_type[scan_y] = DT_I32;
+        end
+        for (scan_x = 0; scan_x < TILE_W; scan_x = scan_x + 1) begin
+            col_reduction_type[scan_x] = DT_I32;
+            col_partial[scan_x] = '0;
+            col_valid[scan_x] = 1'b0;
+        end
+        for (scan_y = 0; scan_y < LANES; scan_y = scan_y + 1) begin
+            scan_result[scan_y] = '0;
+        end
+        found_active_col = 1'b0;
+        col_type_work = DT_I32;
+        col_has_nan = 1'b0;
+        col_sum_value = '0;
+        col_left_value = '0;
+        col_right_value = '0;
+        scan_running = '0;
+        scan_has = 1'b0;
+        scan_type_work = DT_I32;
+        scan_prior = '0;
+        scan_cur = '0;
+        dot_acc = '0;
+        dot_acc_wide = '0;
+        dot_type_work = DT_I32;
+        dot_has = 1'b0;
+        dot_prod = '0;
+
+        if (state == ST_EXEC) begin
+            if ((instruction_opcode_q == OP_REDUCE_SUM_COL) ||
+                (instruction_opcode_q == OP_REDUCE_MAX_COL)) begin
+                for (scan_y = 0; scan_y < TILE_W; scan_y = scan_y + 1) begin
+                    col_reduction[scan_y] = '0;
+                    col_reduction_type[scan_y] = DT_I32;
+                    found_active_col = 1'b0;
+                    col_type_work = DT_I32;
+                    col_has_nan = 1'b0;
+                    for (scan_x = 0; scan_x < TILE_H; scan_x = scan_x + 1) begin
+                        col_partial[scan_x] = '0;
+                        col_valid[scan_x] = 1'b0;
+                        if (!found_active_col &&
+                            instruction_lane_mask_q[scan_x*TILE_W+scan_y]) begin
+                            col_reduction_type[scan_y] = (instruction_dtype_q == DT_INHERIT) ?
+                                operand_a[scan_x*TILE_W+scan_y][131:128] : instruction_dtype_q;
+                            found_active_col = 1'b1;
+                        end
+                    end
+                    if (found_active_col && dtype_is_valid(col_reduction_type[scan_y]) &&
+                        opcode_supports_dtype(instruction_opcode_q, col_reduction_type[scan_y])) begin
+                        col_type_work = col_reduction_type[scan_y];
+                        for (scan_x = 0; scan_x < TILE_H; scan_x = scan_x + 1) begin
+                            col_partial[scan_x] = operand_a[scan_x*TILE_W+scan_y][127:0];
+                            col_valid[scan_x] = instruction_lane_mask_q[scan_x*TILE_W+scan_y];
+                            if ((col_type_work == DT_BF16) && col_valid[scan_x] &&
+                                (col_partial[scan_x][14:7] == 8'hff) &&
+                                (col_partial[scan_x][6:0] != 0))
+                                col_has_nan = 1'b1;
+                            if ((col_type_work == DT_F32) && col_valid[scan_x] &&
+                                (col_partial[scan_x][30:23] == 8'hff) &&
+                                (col_partial[scan_x][22:0] != 0))
+                                col_has_nan = 1'b1;
+                        end
+                        for (col_stage = 0; col_stage < REDUCE_STAGES; col_stage = col_stage + 1) begin
+                            col_stride = 1 << col_stage;
+                            for (col_col = 0; col_col < TILE_H; col_col = col_col + 1) begin
+                                if (((col_col % (2*col_stride)) == 0) &&
+                                    (col_col + col_stride < TILE_H)) begin
+                                    if (col_valid[col_col] && col_valid[col_col+col_stride]) begin
+                                        if (instruction_opcode_q == OP_REDUCE_SUM_COL) begin
+                                            if (col_type_work == DT_BF16) begin
+                                                col_partial[col_col] = {112'b0,
+                                                    bf16_add(col_partial[col_col][15:0],
+                                                             col_partial[col_col+col_stride][15:0])};
+                                            end else if (col_type_work == DT_F32) begin
+                                                col_partial[col_col] = {96'b0,
+                                                    f32_add(col_partial[col_col][31:0],
+                                                            col_partial[col_col+col_stride][31:0])};
+                                            end else begin
+                                                col_sum_value =
+                                                    $signed(sign_extend_by_type(col_partial[col_col], col_type_work)) +
+                                                    $signed(sign_extend_by_type(col_partial[col_col+col_stride], col_type_work));
+                                                col_partial[col_col] =
+                                                    truncate_by_type(col_sum_value, col_type_work);
+                                            end
+                                        end else if (instruction_opcode_q == OP_REDUCE_MAX_COL) begin
+                                            if (col_type_work == DT_BF16) begin
+                                                if (((col_partial[col_col][14:7] == 8'hff) &&
+                                                     (col_partial[col_col][6:0] != 0)) ||
+                                                    ((col_partial[col_col+col_stride][14:7] == 8'hff) &&
+                                                     (col_partial[col_col+col_stride][6:0] != 0))) begin
+                                                    col_partial[col_col] = {112'b0, 16'h7fc0};
+                                                    col_has_nan = 1'b1;
+                                                end else if (bf16_less_than(
+                                                    col_partial[col_col][15:0],
+                                                    col_partial[col_col+col_stride][15:0])) begin
+                                                    col_partial[col_col] = col_partial[col_col+col_stride];
+                                                end
+                                            end else if (col_type_work == DT_F32) begin
+                                                if (((col_partial[col_col][30:23] == 8'hff) &&
+                                                     (col_partial[col_col][22:0] != 0)) ||
+                                                    ((col_partial[col_col+col_stride][30:23] == 8'hff) &&
+                                                     (col_partial[col_col+col_stride][22:0] != 0))) begin
+                                                    col_partial[col_col] = {96'b0, 32'h7fc00000};
+                                                    col_has_nan = 1'b1;
+                                                end else if (f32_less_than(
+                                                    col_partial[col_col][31:0],
+                                                    col_partial[col_col+col_stride][31:0])) begin
+                                                    col_partial[col_col] = col_partial[col_col+col_stride];
+                                                end
+                                            end else begin
+                                                col_left_value =
+                                                    $signed(sign_extend_by_type(col_partial[col_col], col_type_work));
+                                                col_right_value =
+                                                    $signed(sign_extend_by_type(col_partial[col_col+col_stride], col_type_work));
+                                                if (col_right_value > col_left_value)
+                                                    col_partial[col_col] = col_partial[col_col+col_stride];
+                                            end
+                                        end
+                                    end else if (!col_valid[col_col] &&
+                                                 col_valid[col_col+col_stride]) begin
+                                        col_partial[col_col] = col_partial[col_col+col_stride];
+                                        col_valid[col_col] = 1'b1;
+                                    end
+                                end
+                            end
+                        end
+                        if (col_has_nan && (col_type_work == DT_BF16))
+                            col_reduction[scan_y] = {112'b0, 16'h7fc0};
+                        else if (col_has_nan && (col_type_work == DT_F32))
+                            col_reduction[scan_y] = {96'b0, 32'h7fc00000};
+                        else if (col_valid[0])
+                            col_reduction[scan_y] =
+                                truncate_by_type(col_partial[0], col_type_work);
+                    end
+                end
+            end
+            if (instruction_opcode_q == OP_SCAN_SUM) begin
+                for (scan_y = 0; scan_y < TILE_H; scan_y = scan_y + 1) begin
+                    scan_type[scan_y] = DT_I32;
+                    scan_type_work = DT_I32;
+                    found_active_col = 1'b0;
+                    for (scan_x = 0; scan_x < TILE_W; scan_x = scan_x + 1) begin
+                        if (!found_active_col && instruction_lane_mask_q[scan_y*TILE_W+scan_x]) begin
+                            scan_type[scan_y] = (instruction_dtype_q == DT_INHERIT) ?
+                                operand_a[scan_y*TILE_W+scan_x][131:128] : instruction_dtype_q;
+                            found_active_col = 1'b1;
+                        end
+                    end
+                    scan_type_work = scan_type[scan_y];
+                    scan_running = '0;
+                    scan_has = 1'b0;
+                    if (found_active_col && dtype_is_valid(scan_type_work) &&
+                        opcode_supports_dtype(instruction_opcode_q, scan_type_work)) begin
+                        for (scan_x = 0; scan_x < TILE_W; scan_x = scan_x + 1) begin
+                            if (instruction_lane_mask_q[scan_y*TILE_W+scan_x]) begin
+                                if (!scan_has) begin
+                                    scan_running = truncate_by_type(operand_a[scan_y*TILE_W+scan_x][127:0], scan_type_work);
+                                    scan_has = 1'b0 + 1;
+                                end else begin
+                                    if (scan_type_work == DT_BF16) begin
+                                        scan_running = {112'b0,
+                                            bf16_add(scan_running[15:0],
+                                                     operand_a[scan_y*TILE_W+scan_x][15:0])};
+                                    end else if (scan_type_work == DT_F32) begin
+                                        scan_running = {96'b0,
+                                            f32_add(scan_running[31:0],
+                                                    operand_a[scan_y*TILE_W+scan_x][31:0])};
+                                    end else begin
+                                        scan_prior = $signed(sign_extend_by_type(scan_running, scan_type_work));
+                                        scan_cur = $signed(sign_extend_by_type(operand_a[scan_y*TILE_W+scan_x][127:0], scan_type_work));
+                                        scan_running = truncate_by_type(scan_prior + scan_cur, scan_type_work);
+                                    end
+                                end
+                                scan_result[scan_y*TILE_W+scan_x] = scan_running;
+                            end
+                        end
+                    end
+                end
+            end
+            if (instruction_opcode_q == OP_DOT_ROW) begin
+                for (dot_y = 0; dot_y < TILE_H; dot_y = dot_y + 1) begin
+                    dot_result[dot_y] = '0;
+                    dot_type[dot_y] = DT_I32;
+                    dot_type_work = DT_I32;
+                    found_active_col = 1'b0;
+                    for (dot_x = 0; dot_x < TILE_W; dot_x = dot_x + 1) begin
+                        if (!found_active_col && instruction_lane_mask_q[dot_y*TILE_W+dot_x]) begin
+                            dot_type[dot_y] = (instruction_dtype_q == DT_INHERIT) ?
+                                operand_a[dot_y*TILE_W+dot_x][131:128] : instruction_dtype_q;
+                            found_active_col = 1'b1;
+                        end
+                    end
+                    dot_type_work = dot_type[dot_y];
+                    dot_acc = 32'b0;
+                    dot_acc_wide = '0;
+                    dot_has = 1'b0;
+                    if (found_active_col && dtype_is_valid(dot_type_work) &&
+                        opcode_supports_dtype(instruction_opcode_q, dot_type_work)) begin
+                        if (dot_type_work == DT_BF16) begin
+                            dot_acc = 32'b0;
+                            for (dot_x = 0; dot_x < TILE_W; dot_x = dot_x + 1) begin
+                                if (instruction_lane_mask_q[dot_y*TILE_W+dot_x]) begin
+                                    dot_prod = f32_mul(bf16_to_f32(operand_a[dot_y*TILE_W+dot_x][15:0]),
+                                                       bf16_to_f32(operand_b[dot_y*TILE_W+dot_x][15:0]));
+                                    dot_acc = f32_add(dot_acc, dot_prod);
+                                end
+                            end
+                            dot_result[dot_y] = {112'b0, f32_to_bf16(dot_acc)};
+                        end else if (dot_type_work == DT_F32) begin
+                            dot_acc = 32'b0;
+                            for (dot_x = 0; dot_x < TILE_W; dot_x = dot_x + 1) begin
+                                if (instruction_lane_mask_q[dot_y*TILE_W+dot_x]) begin
+                                    dot_prod = f32_mul(operand_a[dot_y*TILE_W+dot_x][31:0],
+                                                       operand_b[dot_y*TILE_W+dot_x][31:0]);
+                                    dot_acc = f32_add(dot_acc, dot_prod);
+                                end
+                            end
+                            dot_result[dot_y] = {96'b0, dot_acc};
+                        end else begin
+                            dot_acc_wide = '0;
+                            for (dot_x = 0; dot_x < TILE_W; dot_x = dot_x + 1) begin
+                                if (instruction_lane_mask_q[dot_y*TILE_W+dot_x]) begin
+                                    dot_acc_wide = dot_acc_wide +
+                                        ($signed(sign_extend_by_type(operand_a[dot_y*TILE_W+dot_x][127:0], dot_type_work)) *
+                                         $signed(sign_extend_by_type(operand_b[dot_y*TILE_W+dot_x][127:0], dot_type_work)));
+                                end
+                            end
+                            dot_result[dot_y] = truncate_by_type(dot_acc_wide, dot_type_work);
+                        end
+                    end
+                end
+            end
         end
     end
 
@@ -1077,6 +1438,11 @@ module grider_tile #(
                     rf_port_enable[port_lane] = 1'b1;
                     rf_port_address[port_lane] = instruction_src_b_q;
                 end
+            end else if (state == ST_WAIT_GATHER) begin
+                for (port_lane = 0; port_lane < LANES; port_lane = port_lane + 1) begin
+                    sram_port_enable[port_lane] = 1'b1;
+                    sram_port_address[port_lane] = operand_a[port_lane][3:0];
+                end
             end else if (state == ST_WAIT_B && operation_has_third_read(instruction_opcode_q)) begin
                 for (port_lane = 0; port_lane < LANES; port_lane = port_lane + 1) begin
                     rf_port_enable[port_lane] = 1'b1;
@@ -1089,7 +1455,9 @@ module grider_tile #(
                         if (writeback_store_q[port_lane]) begin
                             sram_port_enable[port_lane] = 1'b1;
                             sram_port_write[port_lane] = 1'b1;
-                            sram_port_address[port_lane] = instruction_immediate_q[3:0];
+                            sram_port_address[port_lane] =
+                                (instruction_opcode_q == OP_SCATTER) ?
+                                operand_b[port_lane][3:0] : instruction_immediate_q[3:0];
                             sram_port_write_data[port_lane] =
                                 {writeback_type_q[port_lane], writeback_data_q[port_lane]};
                         end else if (writeback_write_q[port_lane]) begin
@@ -1123,9 +1491,15 @@ module grider_tile #(
                 lane_dtype[lane] = (instruction_dtype_q == DT_INHERIT) ? operand_b[lane][131:128] : instruction_dtype_q;
             end else if ((instruction_opcode_q == OP_REDUCE_SUM) || (instruction_opcode_q == OP_REDUCE_MAX)) begin
                 lane_dtype[lane] = row_reduction_type[lane / TILE_W];
-            end else if (instruction_opcode_q == OP_LOAD) begin
+            end else if ((instruction_opcode_q == OP_REDUCE_SUM_COL) || (instruction_opcode_q == OP_REDUCE_MAX_COL)) begin
+                lane_dtype[lane] = col_reduction_type[lane % TILE_W];
+            end else if (instruction_opcode_q == OP_SCAN_SUM) begin
+                lane_dtype[lane] = scan_type[lane / TILE_W];
+            end else if (instruction_opcode_q == OP_DOT_ROW) begin
+                lane_dtype[lane] = dot_type[lane / TILE_W];
+            end else if ((instruction_opcode_q == OP_LOAD) || (instruction_opcode_q == OP_GATHER)) begin
                 lane_dtype[lane] = load_operand[lane][131:128];
-            end else if ((instruction_opcode_q == OP_MOV) || (instruction_opcode_q == OP_NEIGHBOR) || (instruction_opcode_q == OP_STORE)) begin
+            end else if ((instruction_opcode_q == OP_MOV) || (instruction_opcode_q == OP_NEIGHBOR) || (instruction_opcode_q == OP_STORE) || (instruction_opcode_q == OP_TRANSPOSE) || (instruction_opcode_q == OP_SCATTER) || (instruction_opcode_q == OP_ROW_BROADCAST) || (instruction_opcode_q == OP_COL_BROADCAST)) begin
                 lane_dtype[lane] = operand_a[lane][131:128];
             end else if (instruction_dtype_q == DT_INHERIT) begin
                 lane_dtype[lane] = operand_a[lane][131:128];
@@ -1138,7 +1512,12 @@ module grider_tile #(
             ny = 0;
 
             if (state == ST_EXEC && instruction_lane_mask_q[lane] &&
-                ((instruction_dtype_q == DT_INHERIT) || dtype_is_valid(instruction_dtype_q)) &&
+                ((instruction_dtype_q == DT_INHERIT) || dtype_is_valid(instruction_dtype_q) ||
+                 (instruction_opcode_q == OP_MOV) || (instruction_opcode_q == OP_NEIGHBOR) ||
+                 (instruction_opcode_q == OP_LOAD) || (instruction_opcode_q == OP_STORE) ||
+                 (instruction_opcode_q == OP_TRANSPOSE) || (instruction_opcode_q == OP_GATHER) ||
+                 (instruction_opcode_q == OP_SCATTER) || (instruction_opcode_q == OP_ROW_BROADCAST) ||
+                 (instruction_opcode_q == OP_COL_BROADCAST)) &&
                 dtype_is_valid(lane_dtype[lane]) &&
                 opcode_supports_dtype(instruction_opcode_q, lane_dtype[lane])) begin
                 case (instruction_opcode_q)
@@ -1168,7 +1547,7 @@ module grider_tile #(
                     end
                     OP_ADD, OP_SUB, OP_MUL, OP_MAC,
                     OP_AND, OP_OR, OP_XOR, OP_SHL, OP_SHR,
-                    OP_MIN, OP_MAX, OP_SEL: begin
+                    OP_MIN, OP_MAX, OP_SEL, OP_DIV: begin
                         signed_a = $signed(sign_extend_by_type(lane_a[lane], lane_dtype[lane]));
                         signed_b = $signed(sign_extend_by_type(lane_b[lane], lane_dtype[lane]));
                         signed_min_a = $signed(sign_extend_by_type(lane_a[lane], lane_dtype[lane]));
@@ -1207,12 +1586,43 @@ module grider_tile #(
                                 end
                                 default: lane_result[lane] = '0;
                             endcase
+                        end else if ((lane_dtype[lane] == DT_F32) &&
+                            ((instruction_opcode_q == OP_ADD) || (instruction_opcode_q == OP_SUB) ||
+                             (instruction_opcode_q == OP_MUL) || (instruction_opcode_q == OP_MAC) ||
+                             (instruction_opcode_q == OP_MIN) || (instruction_opcode_q == OP_MAX))) begin
+                            case (instruction_opcode_q)
+                                OP_ADD: lane_result[lane] = {96'b0, f32_add(lane_a[lane][31:0], lane_b[lane][31:0])};
+                                OP_SUB: lane_result[lane] = {96'b0, f32_add(lane_a[lane][31:0], {~lane_b[lane][31], lane_b[lane][30:0]})};
+                                OP_MUL: lane_result[lane] = {96'b0, f32_mul(lane_a[lane][31:0], lane_b[lane][31:0])};
+                                OP_MAC: begin
+                                    lane_result[lane] = {96'b0,
+                                        f32_add(operand_acc[lane][31:0],
+                                                f32_mul(lane_a[lane][31:0], lane_b[lane][31:0]))};
+                                    lane_result_type[lane] = DT_F32;
+                                end
+                                OP_MIN: begin
+                                    if (((lane_a[lane][30:23] == 8'hff) && (lane_a[lane][22:0] != 0)) ||
+                                        ((lane_b[lane][30:23] == 8'hff) && (lane_b[lane][22:0] != 0)))
+                                        lane_result[lane] = {96'b0, 32'h7fc00000};
+                                    else
+                                        lane_result[lane] = f32_less_than(lane_b[lane][31:0], lane_a[lane][31:0]) ? {96'b0, lane_b[lane][31:0]} : {96'b0, lane_a[lane][31:0]};
+                                end
+                                OP_MAX: begin
+                                    if (((lane_a[lane][30:23] == 8'hff) && (lane_a[lane][22:0] != 0)) ||
+                                        ((lane_b[lane][30:23] == 8'hff) && (lane_b[lane][22:0] != 0)))
+                                        lane_result[lane] = {96'b0, 32'h7fc00000};
+                                    else
+                                        lane_result[lane] = f32_less_than(lane_a[lane][31:0], lane_b[lane][31:0]) ? {96'b0, lane_b[lane][31:0]} : {96'b0, lane_a[lane][31:0]};
+                                end
+                                default: lane_result[lane] = '0;
+                            endcase
                         end else begin
                             case (instruction_opcode_q)
                                 OP_ADD: lane_result[lane] = signed_a + signed_b;
                                 OP_SUB: lane_result[lane] = signed_a - signed_b;
                                 OP_MUL: lane_result[lane] = signed_a * signed_b;
                                 OP_MAC: lane_result[lane] = lane_acc[lane] + (signed_a * signed_b);
+                                OP_DIV: lane_result[lane] = (signed_b == 0) ? '0 : (signed_a / signed_b);
                                 OP_AND: lane_result[lane] = lane_a[lane] & lane_b[lane];
                                 OP_OR:  lane_result[lane] = lane_a[lane] | lane_b[lane];
                                 OP_XOR: lane_result[lane] = lane_a[lane] ^ lane_b[lane];
@@ -1299,6 +1709,49 @@ module grider_tile #(
                         lane_result_type[lane] = row_reduction_type[lane / TILE_W];
                         lane_write[lane] = 1'b1;
                     end
+                    OP_REDUCE_SUM_COL, OP_REDUCE_MAX_COL: begin
+                        lane_result[lane] = col_reduction[lane % TILE_W];
+                        lane_result_type[lane] = col_reduction_type[lane % TILE_W];
+                        lane_write[lane] = 1'b1;
+                    end
+                    OP_SCAN_SUM: begin
+                        lane_result[lane] = scan_result[lane];
+                        lane_result_type[lane] = scan_type[lane / TILE_W];
+                        lane_write[lane] = 1'b1;
+                    end
+                    OP_DOT_ROW: begin
+                        lane_result[lane] = dot_result[lane / TILE_W];
+                        lane_result_type[lane] = dot_type[lane / TILE_W];
+                        lane_write[lane] = 1'b1;
+                    end
+                    OP_TRANSPOSE: begin
+                        perm_src = tile_permute_lane(lane, instruction_immediate_q[2:0]);
+                        lane_result[lane] = operand_a[perm_src][127:0];
+                        lane_result_type[lane] = operand_a[perm_src][131:128];
+                        lane_write[lane] = 1'b1;
+                    end
+                    OP_GATHER: begin
+                        lane_result[lane] = load_operand[lane][127:0];
+                        lane_result_type[lane] = load_operand[lane][131:128];
+                        lane_write[lane] = 1'b1;
+                    end
+                    OP_SCATTER: begin
+                        lane_store[lane] = 1'b1;
+                        lane_result[lane] = lane_a[lane];
+                        lane_result_type[lane] = operand_a[lane][131:128];
+                    end
+                    OP_ROW_BROADCAST: begin
+                        bc_lane = (lane / TILE_W) * TILE_W;
+                        lane_result[lane] = operand_a[bc_lane][127:0];
+                        lane_result_type[lane] = operand_a[bc_lane][131:128];
+                        lane_write[lane] = 1'b1;
+                    end
+                    OP_COL_BROADCAST: begin
+                        bc_lane = lane % TILE_W;
+                        lane_result[lane] = operand_a[bc_lane][127:0];
+                        lane_result_type[lane] = operand_a[bc_lane][131:128];
+                        lane_write[lane] = 1'b1;
+                    end
                     default: begin end
                 endcase
             end
@@ -1375,10 +1828,17 @@ module grider_tile #(
                                     rf_port_read_data[same_tile_neighbor(i, instruction_immediate_q[2:0])];
                         end
                     end
-                    if (operation_has_src_b(instruction_opcode_q))
+                    if (instruction_opcode_q == OP_GATHER)
+                        state <= ST_WAIT_GATHER;
+                    else if (operation_has_src_b(instruction_opcode_q))
                         state <= ST_WAIT_B;
                     else
                         state <= ST_EXEC;
+                end
+                ST_WAIT_GATHER: begin
+                    for (i = 0; i < LANES; i = i + 1)
+                        load_operand[i] <= sram_port_read_data[i];
+                    state <= ST_EXEC;
                 end
                 ST_WAIT_B: begin
                     for (i = 0; i < LANES; i = i + 1)

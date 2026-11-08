@@ -93,6 +93,81 @@ class TileEmulatorTests(unittest.TestCase):
         self.assertEqual(result[7], -1)
         self.assertEqual(sum(value != 0 for value in result), 1)
 
+    def test_transpose_permutation(self):
+        tile = Tile()
+        tile.load_register(0, list(range(256)), DataType.I16)
+        tile.step(Instruction(Opcode.TRANSPOSE, dst=1, src_a=0, imm=0))
+        result = tile.read_register(1)
+        self.assertEqual(result[1], 16)
+        self.assertEqual(result[16], 1)
+        tile.step(Instruction(Opcode.TRANSPOSE, dst=2, src_a=1, imm=0))
+        self.assertEqual(tile.read_register(2), list(range(256)))
+
+    def test_rotation_and_flip_permutations(self):
+        tile = Tile()
+        tile.load_register(0, list(range(256)), DataType.I16)
+        tile.step(Instruction(Opcode.TRANSPOSE, dst=1, src_a=0, imm=1))
+        self.assertEqual(tile.read_register(1)[0], 15)
+        tile.step(Instruction(Opcode.TRANSPOSE, dst=1, src_a=0, imm=6))
+        self.assertEqual(tile.read_register(1)[0], 255)
+
+    def test_column_reduction(self):
+        tile = Tile()
+        tile.load_register(0, list(range(256)), DataType.I16)
+        tile.step(Instruction(Opcode.REDUCE_SUM_COL, dst=1, src_a=0, dtype=DataType.I16))
+        result = tile.read_register(1)
+        self.assertEqual(result[0], sum(row * 16 for row in range(16)))
+        self.assertEqual(result[16], result[0])
+        tile.step(Instruction(Opcode.REDUCE_MAX_COL, dst=2, src_a=0, dtype=DataType.I16))
+        self.assertEqual(tile.read_register(2)[0], 240)
+
+    def test_scan_sum_prefix(self):
+        tile = Tile()
+        tile.load_register(0, [1] * 256, DataType.I16)
+        tile.step(Instruction(Opcode.SCAN_SUM, dst=1, src_a=0, dtype=DataType.I16))
+        result = tile.read_register(1)
+        self.assertEqual(result[:16], list(range(1, 17)))
+        self.assertEqual(result[16], 1)
+
+    def test_dot_row_and_div(self):
+        tile = Tile()
+        tile.load_register(0, [3] * 256, DataType.I32)
+        tile.load_register(1, [4] * 256, DataType.I32)
+        tile.step(Instruction(Opcode.DOT_ROW, dst=2, src_a=0, src_b=1, dtype=DataType.I32))
+        self.assertEqual(tile.read_register(2)[0], 16 * 12)
+        tile.step(Instruction(Opcode.DIV, dst=3, src_a=0, src_b=1, dtype=DataType.I32))
+        self.assertEqual(tile.read_register(3)[0], 0)  # 3 // 4 = 0
+
+    def test_gather_scatter_indirect_sram(self):
+        tile = Tile()
+        tile.load_register(0, list(range(256)), DataType.I16)
+        tile.step(Instruction(Opcode.STORE, src_a=0, imm=3))
+        tile.load_register(4, [3] * 256, DataType.I16)
+        tile.step(Instruction(Opcode.GATHER, dst=6, src_a=4))
+        self.assertEqual(tile.read_register(6)[7], 7)
+        tile.load_register(2, [99] * 256, DataType.I16)
+        tile.load_register(3, [5] * 256, DataType.I16)
+        tile.step(Instruction(Opcode.SCATTER, src_a=2, src_b=3))
+        self.assertEqual(tile.read_sram(5, 0), 99)
+
+    def test_row_col_broadcast(self):
+        tile = Tile()
+        tile.load_register(0, [lane % 16 for lane in range(256)], DataType.I16)
+        tile.step(Instruction(Opcode.ROW_BROADCAST, dst=1, src_a=0))
+        self.assertEqual(tile.read_register(1)[1], 0)
+        tile.step(Instruction(Opcode.COL_BROADCAST, dst=2, src_a=0))
+        self.assertEqual(tile.read_register(2)[17], 1)
+
+    def test_f32_elementwise_and_mac(self):
+        tile = Tile()
+        tile.load_register(0, [1.5] * 256, DataType.F32)
+        tile.load_register(1, [2.25] * 256, DataType.F32)
+        tile.step(Instruction(Opcode.ADD, dst=2, src_a=0, src_b=1, dtype=DataType.F32))
+        self.assertAlmostEqual(tile.read_register(2)[0], 3.75)
+        tile.load_register(3, [1.0] * 256, DataType.F32)
+        tile.step(Instruction(Opcode.MAC, dst=3, src_a=0, src_b=1, dtype=DataType.F32))
+        self.assertAlmostEqual(tile.read_register(3)[0], 1.0 + 1.5 * 2.25)
+
 
 if __name__ == "__main__":
     unittest.main()

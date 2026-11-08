@@ -4,6 +4,7 @@ __pycache__/
 *.py[cod]
 .venv/
 .tools/
+.iverilog/
 build/
 # Generated simulator outputs
 *.vvp

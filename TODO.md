@@ -2,7 +2,7 @@
 
 # Grider TODO
 
-最終更新: 2026-10-26
+最終更新: 2026-11-08
 
 ## 完了
 
@@ -19,6 +19,9 @@
   - `grider.verify_rtl`で27命令を実行し、256セルの全レジスタ/SRAM計8,192ワードを比較。一致を確認。
 - [x] マルチタイル化（機能プロトタイプ）
   - Python MeshとRTL Meshを実装。2×2構成で8方向haloを比較し、9,216レジスタワードが一致。
+- [x] ISA v0.3セル・データフロー拡張（AI/描画GPU）
+  - `TRANSPOSE`、`REDUCE_SUM_COL`/`REDUCE_MAX_COL`、`SCAN_SUM`、`DOT_ROW`、`GATHER`/`SCATTER`、`ROW/COL_BROADCAST`、整数`DIV`、F32 elementwiseを追加。Python/RTLの全レジスタ/SRAM一致を`verify_rtl`で確認。
+  - `grider.kernels`にRMSNorm/SiLU/SwiGLU/RoPE/conv2d/histogram/top-k、`grider.render`にblur/Sobel/bilinear/blend/barycentric/Lambertを追加。`grider.dataflow`にAI/描画パイプライン見積を追加。`lowering`にtranspose/QK loweringを追加。
 
 ## 進行中
 

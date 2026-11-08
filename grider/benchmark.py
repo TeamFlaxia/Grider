@@ -37,6 +37,12 @@ CASES = (
     Case("BF16_MUL", Opcode.MUL, 4, 1, 2, DataType.BF16, 4, 1, True, 3.0),
     Case("BF16_MAC", Opcode.MAC, 0, 1, 2, DataType.BF16, 5, 2, True, 48.5),
     Case("I32_MAC", Opcode.MAC, 5, 6, 6, DataType.I32, 5, 2, False, 151),
+    Case("F32_ADD", Opcode.ADD, 3, 8, 9, DataType.F32, 4, 1, True, 3.5),
+    # 1-read tile moves/reductions: 3 cycles/instruction.
+    Case("TRANSPOSE", Opcode.TRANSPOSE, 3, 1, 2, DataType.BF16, 3, 1, False, 1.5),
+    Case("REDUCE_SUM_COL", Opcode.REDUCE_SUM_COL, 3, 5, 2, DataType.I32, 3, 1, False, 112),
+    # DOT_ROW: 4 cycles, one FMA per output lane (16 per row).
+    Case("DOT_ROW_BF16", Opcode.DOT_ROW, 3, 1, 2, DataType.BF16, 4, 1, True, 48.0),
 )
 
 
@@ -47,6 +53,13 @@ def _init_tile() -> Tile:
     tile.load_register(2, [2.0] * LANES, DataType.BF16)
     tile.load_register(5, [7] * LANES, DataType.I32)
     tile.load_register(6, [3] * LANES, DataType.I32)
+    tile.load_register(7, [1] * LANES, DataType.I32)
+    tile.load_register(8, [1.5] * LANES, DataType.F32)
+    tile.load_register(9, [2.0] * LANES, DataType.F32)
+    # F32_ADD reads regs 1/2 as F32 (1.5, 2.0) via dtype F32; the BF16 payloads
+    # of 1.5/2.0 reinterpreted as F32 are small subnormals, so the legacy BF16
+    # registers cannot serve F32_ADD. Point F32_ADD at the F32 registers
+    # instead by redefining its source registers below.
     return tile
 
 
@@ -105,14 +118,14 @@ def main() -> None:
     if args.clock_mhz <= 0:
         parser.error("--clock-mhz must be positive")
 
-    tile = _init_tile()
     print(
         f"Grider functional kernel run: {args.lanes}/{LANES} active lanes, "
         f"{args.iterations} instructions/kernel, {args.clock_mhz:.3f} MHz assumed"
     )
-    print("Rates use RTL latency: BF16 ADD/MUL=4 cycles, MAC=5 cycles.")
+    print("Rates use RTL latency (see Case table).")
     print("Emulator wall time is functional Python time, not hardware time.")
     for case in CASES:
+        tile = _init_tile()
         result = run_case(tile, case, args.iterations, args.lanes, args.clock_mhz)
         unit = "MFLOPS" if case.is_floating_point else "M integer ops/s"
         rate_giga = result["rate_mops"] / 1000
