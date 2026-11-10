@@ -317,6 +317,90 @@ def _f32_max_bits(a_bits: int, b_bits: int) -> int:
     return b_bits if _f32_less_than(a_bits, b_bits) else a_bits
 
 
+_BF16_SIGN_BIT = 0x8000
+_BF16_INFINITY = 0x7F80
+_BF16_QUIET_NAN = 0x7FC0
+_BF16_EXPONENT_MASK = 0x7F80
+_BF16_FRACTION_MASK = 0x007F
+
+
+def _bf16_is_nan(bits: int) -> bool:
+    return (bits & _BF16_EXPONENT_MASK) == _BF16_EXPONENT_MASK and (bits & _BF16_FRACTION_MASK) != 0
+
+
+def _bf16_is_inf(bits: int) -> bool:
+    return (bits & _BF16_EXPONENT_MASK) == _BF16_EXPONENT_MASK and (bits & _BF16_FRACTION_MASK) == 0
+
+
+def _bf16_is_zero(bits: int) -> bool:
+    return (bits & 0x7FFF) == 0
+
+
+def _bf16_exact(bits: int) -> Fraction:
+    """Return the exact value of a finite bfloat16 bit pattern."""
+    sign = -1 if bits & _BF16_SIGN_BIT else 1
+    exponent = (bits >> 7) & 0xFF
+    fraction = bits & _BF16_FRACTION_MASK
+    if exponent == 0:
+        return Fraction(sign * fraction, 1 << 133)
+    mantissa = (1 << 7) | fraction
+    power = exponent - 127 - 7
+    if power >= 0:
+        return Fraction(sign * mantissa * (1 << power))
+    return Fraction(sign * mantissa, 1 << -power)
+
+
+def _bf16_round(value: Fraction) -> int:
+    """Round an exact value to bfloat16 using round-to-nearest, ties-to-even."""
+    if value == 0:
+        return 0
+    negative = value < 0
+    magnitude = -value if negative else value
+    sign_bit = _BF16_SIGN_BIT if negative else 0
+    if magnitude >= Fraction(2) ** 128:
+        return sign_bit | _BF16_INFINITY
+    exponent = magnitude.numerator.bit_length() - magnitude.denominator.bit_length()
+    if magnitude < Fraction(2) ** exponent:
+        exponent -= 1
+    elif magnitude >= Fraction(2) ** (exponent + 1):
+        exponent += 1
+    if exponent < -126:
+        quantum = Fraction(2) ** -133
+        significand = magnitude / quantum
+        whole = significand.numerator // significand.denominator
+        remainder = significand - whole
+        if remainder > Fraction(1, 2) or (remainder == Fraction(1, 2) and (whole & 1)):
+            whole += 1
+        if whole >= (1 << 7):
+            return sign_bit | (1 << 7)
+        return sign_bit | whole
+    quantum = Fraction(2) ** (exponent - 7)
+    significand = magnitude / quantum
+    whole = significand.numerator // significand.denominator
+    remainder = significand - whole
+    if remainder > Fraction(1, 2) or (remainder == Fraction(1, 2) and (whole & 1)):
+        whole += 1
+    if whole >= (1 << 8):
+        whole >>= 1
+        exponent += 1
+        if exponent > 127:
+            return sign_bit | _BF16_INFINITY
+    return sign_bit | ((exponent + 127) << 7) | (whole - (1 << 7))
+
+
+def _bf16_add_bits(a_bits: int, b_bits: int) -> int:
+    if _bf16_is_nan(a_bits) or _bf16_is_nan(b_bits):
+        return _BF16_QUIET_NAN
+    if _bf16_is_inf(a_bits) or _bf16_is_inf(b_bits):
+        if (_bf16_is_inf(a_bits) and _bf16_is_inf(b_bits)
+                and (a_bits & _BF16_SIGN_BIT) != (b_bits & _BF16_SIGN_BIT)):
+            return _BF16_QUIET_NAN
+        return a_bits if _bf16_is_inf(a_bits) else b_bits
+    if _bf16_is_zero(a_bits) and _bf16_is_zero(b_bits):
+        return (a_bits & b_bits) & _BF16_SIGN_BIT
+    return _bf16_round(_bf16_exact(a_bits) + _bf16_exact(b_bits))
+
+
 def f32_to_float(value: int) -> float:
     return struct.unpack(">f", struct.pack(">I", value & 0xFFFFFFFF))[0]
 
@@ -500,38 +584,30 @@ class Tile:
                 out_type = dtype if dtype is not None else self._rf[active[0]][insn.src_a].dtype
                 if not _supports_dtype(op, out_type):
                     continue
-                running = _Register(0, out_type)
-                has_value = False
+                prefix: list[int] = []
                 for lane in lanes:
-                    if not ((insn.lane_mask >> lane) & 1):
-                        continue
-                    value = _decode(self._rf[lane][insn.src_a], out_type)
-                    if not has_value:
+                    if (insn.lane_mask >> lane) & 1:
                         if out_type == DataType.F32:
-                            payload = self._rf[lane][insn.src_a].payload & 0xFFFFFFFF
+                            prefix.append(self._rf[lane][insn.src_a].payload & 0xFFFFFFFF)
                         elif out_type == DataType.BF16:
-                            payload = float_to_bf16(float(value))
+                            prefix.append(self._rf[lane][insn.src_a].payload & 0xFFFF)
                         else:
-                            payload = _pack(int(value), out_type)
-                        running = _Register(payload, out_type)
-                        has_value = True
+                            prefix.append(_pack(int(_decode(self._rf[lane][insn.src_a], out_type)), out_type))
                     else:
+                        prefix.append(0)
+                stride = 1
+                while stride < self.width:
+                    for col in range(self.width - 1, stride - 1, -1):
                         if out_type == DataType.F32:
-                            payload = _f32_add_bits(running.payload & 0xFFFFFFFF,
-                                                    self._rf[lane][insn.src_a].payload & 0xFFFFFFFF)
+                            prefix[col] = _f32_add_bits(prefix[col], prefix[col - stride])
+                        elif out_type == DataType.BF16:
+                            prefix[col] = _bf16_add_bits(prefix[col], prefix[col - stride])
                         else:
-                            prior = _decode(running, out_type)
-                            summed = float(prior) + float(value)
-                            if out_type == DataType.BF16:
-                                # NaN propagates through BF16 scan like reductions.
-                                if math.isnan(summed):
-                                    payload = 0x7FC0
-                                else:
-                                    payload = float_to_bf16(summed)
-                            else:
-                                payload = _pack(int(int(prior) + int(value)), out_type)
-                        running = _Register(payload, out_type)
-                    self._rf[lane][insn.dst] = _Register(running.payload, running.dtype)
+                            prefix[col] = _pack(int(prefix[col]) + int(prefix[col - stride]), out_type)
+                    stride *= 2
+                for col in range(self.width):
+                    if (insn.lane_mask >> lanes[col]) & 1:
+                        self._rf[lanes[col]][insn.dst] = _Register(prefix[col], out_type)
             self.cycles += 1
             return
 
@@ -544,27 +620,47 @@ class Tile:
                 out_type = dtype if dtype is not None else self._rf[active[0]][insn.src_a].dtype
                 if not _supports_dtype(op, out_type):
                     continue
-                if out_type == DataType.F32:
-                    acc_bits = 0
-                    for lane in active:
-                        a_bits = self._rf[lane][insn.src_a].payload & 0xFFFFFFFF
-                        b_bits = self._rf[lane][insn.src_b].payload & 0xFFFFFFFF
-                        acc_bits = _f32_add_bits(acc_bits, _f32_mul_bits(a_bits, b_bits))
-                    result = _Register(acc_bits, DataType.F32)
-                elif out_type == DataType.BF16:
-                    acc_bits = 0
-                    for lane in active:
-                        a_bits = (self._rf[lane][insn.src_a].payload & 0xFFFF) << 16
-                        b_bits = (self._rf[lane][insn.src_b].payload & 0xFFFF) << 16
-                        acc_bits = _f32_add_bits(acc_bits, _f32_mul_bits(a_bits, b_bits))
-                    result = _Register(float_to_bf16(f32_to_float(acc_bits)), DataType.BF16)
+                products: list[int] = []
+                valid: list[bool] = []
+                for lane in lanes:
+                    if (insn.lane_mask >> lane) & 1:
+                        if out_type == DataType.F32:
+                            a_bits = self._rf[lane][insn.src_a].payload & 0xFFFFFFFF
+                            b_bits = self._rf[lane][insn.src_b].payload & 0xFFFFFFFF
+                            products.append(_f32_mul_bits(a_bits, b_bits))
+                        elif out_type == DataType.BF16:
+                            a_bits = (self._rf[lane][insn.src_a].payload & 0xFFFF) << 16
+                            b_bits = (self._rf[lane][insn.src_b].payload & 0xFFFF) << 16
+                            products.append(_f32_mul_bits(a_bits, b_bits))
+                        else:
+                            av = int(_decode(self._rf[lane][insn.src_a], out_type))
+                            bv = int(_decode(self._rf[lane][insn.src_b], out_type))
+                            products.append(av * bv)
+                        valid.append(True)
+                    else:
+                        products.append(0)
+                        valid.append(False)
+                stride = 1
+                while stride < self.width:
+                    for start in range(0, self.width, stride * 2):
+                        if start + stride < self.width:
+                            if valid[start] and valid[start + stride]:
+                                if out_type in (DataType.BF16, DataType.F32):
+                                    products[start] = _f32_add_bits(products[start], products[start + stride])
+                                else:
+                                    products[start] = products[start] + products[start + stride]
+                            elif not valid[start] and valid[start + stride]:
+                                products[start] = products[start + stride]
+                                valid[start] = True
+                    stride *= 2
+                if not valid[0]:
+                    continue
+                if out_type == DataType.BF16:
+                    result = _Register(float_to_bf16(f32_to_float(products[0])), DataType.BF16)
+                elif out_type == DataType.F32:
+                    result = _Register(products[0], DataType.F32)
                 else:
-                    acc = 0
-                    for lane in active:
-                        av = int(_decode(self._rf[lane][insn.src_a], out_type))
-                        bv = int(_decode(self._rf[lane][insn.src_b], out_type))
-                        acc = int(acc) + int(av) * int(bv)
-                    result = _Register(_pack(int(acc), out_type), out_type)
+                    result = _Register(_pack(int(products[0]), out_type), out_type)
                 for lane in active:
                     self._rf[lane][insn.dst] = _Register(result.payload, result.dtype)
             self.cycles += 1

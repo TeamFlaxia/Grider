@@ -217,12 +217,18 @@ def execute_lowered_qk_scores_row16(q_row: Sequence[float],
     from .sim import _f32_add_bits, _f32_mul_bits, bf16_to_float as _bf, f32_to_float
     ref_bf: list[float] = []
     for row in range(16):
-        acc_bits = 0
-        for i in range(16):
-            a_bits = float_to_bf16(float(q_row[i])) << 16
-            b_bits = float_to_bf16(float(k[row][i])) << 16
-            acc_bits = _f32_add_bits(acc_bits, _f32_mul_bits(a_bits, b_bits))
-        ref_bf.append(_bf(float_to_bf16(f32_to_float(acc_bits))))
+        products = [
+            _f32_mul_bits(float_to_bf16(float(q_row[i])) << 16,
+                          float_to_bf16(float(k[row][i])) << 16)
+            for i in range(16)
+        ]
+        stride = 1
+        while stride < 16:
+            for start in range(0, 16, stride * 2):
+                if start + stride < 16:
+                    products[start] = _f32_add_bits(products[start], products[start + stride])
+            stride *= 2
+        ref_bf.append(_bf(float_to_bf16(f32_to_float(products[0]))))
     flat_output = [float(flat[row * 16]) for row in range(16)]
     differences = [
         abs(float(flat_output[row]) - float(ref_bf[row])) for row in range(16)

@@ -330,20 +330,22 @@ module grider_tile #(
     logic found_active_col;
     integer scan_y;
     integer scan_x;
-    logic [127:0] scan_running;
-    logic scan_has;
     logic [3:0] scan_type_work;
     logic signed [127:0] scan_prior;
     logic signed [127:0] scan_cur;
+    logic [127:0] scan_prefix [0:TILE_W-1];
+    integer scan_stage;
+    integer scan_stride;
     integer dot_y;
     integer dot_x;
-    logic [31:0] dot_acc;
-    logic [127:0] dot_acc_wide;
     logic [3:0] dot_type_work;
-    logic dot_has;
-    logic [31:0] dot_prod;
     logic signed [63:0] dot_a_64;
     logic signed [63:0] dot_b_64;
+    logic [127:0] dot_product [0:TILE_W-1];
+    logic [TILE_W-1:0] dot_product_valid;
+    integer dot_stage;
+    integer dot_stride;
+    integer dot_col;
     integer perm_src;
     integer bc_lane;
     integer col_stage;
@@ -1156,18 +1158,24 @@ module grider_tile #(
         col_sum_value = '0;
         col_left_value = '0;
         col_right_value = '0;
-        scan_running = '0;
-        scan_has = 1'b0;
         scan_type_work = DT_I32;
         scan_prior = '0;
         scan_cur = '0;
-        dot_acc = '0;
-        dot_acc_wide = '0;
+        for (scan_x = 0; scan_x < TILE_W; scan_x = scan_x + 1) begin
+            scan_prefix[scan_x] = '0;
+        end
+        scan_stage = 0;
+        scan_stride = 0;
         dot_type_work = DT_I32;
-        dot_has = 1'b0;
-        dot_prod = '0;
         dot_a_64 = '0;
         dot_b_64 = '0;
+        for (dot_col = 0; dot_col < TILE_W; dot_col = dot_col + 1) begin
+            dot_product[dot_col] = '0;
+            dot_product_valid[dot_col] = 1'b0;
+        end
+        dot_stage = 0;
+        dot_stride = 0;
+        dot_col = 0;
         col_stage = 0;
         col_stride = 0;
         col_col = 0;
@@ -1295,32 +1303,38 @@ module grider_tile #(
                         end
                     end
                     scan_type_work = scan_type[scan_y];
-                    scan_running = '0;
-                    scan_has = 1'b0;
                     if (found_active_col && dtype_is_valid(scan_type_work) &&
                         opcode_supports_dtype(instruction_opcode_q, scan_type_work)) begin
+                        // Kogge-Stone inclusive prefix scan. The serial running
+                        // sum was the tile critical path; the parallel network
+                        // leaves four adder levels.
                         for (scan_x = 0; scan_x < TILE_W; scan_x = scan_x + 1) begin
-                            if (instruction_lane_mask_q[scan_y*TILE_W+scan_x]) begin
-                                if (!scan_has) begin
-                                    scan_running = truncate_by_type(operand_a[scan_y*TILE_W+scan_x][127:0], scan_type_work);
-                                    scan_has = 1'b0 + 1;
-                                end else begin
+                            scan_prefix[scan_x] = instruction_lane_mask_q[scan_y*TILE_W+scan_x] ?
+                                truncate_by_type(operand_a[scan_y*TILE_W+scan_x][127:0], scan_type_work) : '0;
+                        end
+                        for (scan_stage = 0; scan_stage < REDUCE_STAGES; scan_stage = scan_stage + 1) begin
+                            scan_stride = 1 << scan_stage;
+                            for (scan_x = TILE_W-1; scan_x >= 0; scan_x = scan_x - 1) begin
+                                if (scan_x >= scan_stride) begin
                                     if (scan_type_work == DT_BF16) begin
-                                        scan_running = {112'b0,
-                                            bf16_add(scan_running[15:0],
-                                                     operand_a[scan_y*TILE_W+scan_x][15:0])};
+                                        scan_prefix[scan_x] = {112'b0,
+                                            bf16_add(scan_prefix[scan_x][15:0],
+                                                     scan_prefix[scan_x-scan_stride][15:0])};
                                     end else if (scan_type_work == DT_F32) begin
-                                        scan_running = {96'b0,
-                                            f32_add(scan_running[31:0],
-                                                    operand_a[scan_y*TILE_W+scan_x][31:0])};
+                                        scan_prefix[scan_x] = {96'b0,
+                                            f32_add(scan_prefix[scan_x][31:0],
+                                                    scan_prefix[scan_x-scan_stride][31:0])};
                                     end else begin
-                                        scan_prior = $signed(sign_extend_by_type(scan_running, scan_type_work));
-                                        scan_cur = $signed(sign_extend_by_type(operand_a[scan_y*TILE_W+scan_x][127:0], scan_type_work));
-                                        scan_running = truncate_by_type(scan_prior + scan_cur, scan_type_work);
+                                        scan_prior = $signed(sign_extend_by_type(scan_prefix[scan_x], scan_type_work));
+                                        scan_cur = $signed(sign_extend_by_type(scan_prefix[scan_x-scan_stride], scan_type_work));
+                                        scan_prefix[scan_x] = truncate_by_type(scan_prior + scan_cur, scan_type_work);
                                     end
                                 end
-                                scan_result[scan_y*TILE_W+scan_x] = scan_running;
                             end
+                        end
+                        for (scan_x = 0; scan_x < TILE_W; scan_x = scan_x + 1) begin
+                            if (instruction_lane_mask_q[scan_y*TILE_W+scan_x])
+                                scan_result[scan_y*TILE_W+scan_x] = scan_prefix[scan_x];
                         end
                     end
                 end
@@ -1339,45 +1353,62 @@ module grider_tile #(
                         end
                     end
                     dot_type_work = dot_type[dot_y];
-                    dot_acc = 32'b0;
-                    dot_acc_wide = '0;
-                    dot_has = 1'b0;
                     if (found_active_col && dtype_is_valid(dot_type_work) &&
                         opcode_supports_dtype(instruction_opcode_q, dot_type_work)) begin
-                        if (dot_type_work == DT_BF16) begin
-                            dot_acc = 32'b0;
-                            for (dot_x = 0; dot_x < TILE_W; dot_x = dot_x + 1) begin
-                                if (instruction_lane_mask_q[dot_y*TILE_W+dot_x]) begin
-                                    dot_prod = f32_mul(bf16_to_f32(operand_a[dot_y*TILE_W+dot_x][15:0]),
-                                                       bf16_to_f32(operand_b[dot_y*TILE_W+dot_x][15:0]));
-                                    dot_acc = f32_add(dot_acc, dot_prod);
-                                end
-                            end
-                            dot_result[dot_y] = {112'b0, f32_to_bf16(dot_acc)};
-                        end else if (dot_type_work == DT_F32) begin
-                            dot_acc = 32'b0;
-                            for (dot_x = 0; dot_x < TILE_W; dot_x = dot_x + 1) begin
-                                if (instruction_lane_mask_q[dot_y*TILE_W+dot_x]) begin
-                                    dot_prod = f32_mul(operand_a[dot_y*TILE_W+dot_x][31:0],
-                                                       operand_b[dot_y*TILE_W+dot_x][31:0]);
-                                    dot_acc = f32_add(dot_acc, dot_prod);
-                                end
-                            end
-                            dot_result[dot_y] = {96'b0, dot_acc};
-                        end else begin
-                            dot_acc_wide = '0;
-                            for (dot_x = 0; dot_x < TILE_W; dot_x = dot_x + 1) begin
-                                if (instruction_lane_mask_q[dot_y*TILE_W+dot_x]) begin
+                        // One product per lane, then a balanced tree. The serial
+                        // 16-term accumulate was long; the tree leaves one
+                        // multiplier plus four adder levels.
+                        for (dot_x = 0; dot_x < TILE_W; dot_x = dot_x + 1) begin
+                            dot_product[dot_x] = '0;
+                            dot_product_valid[dot_x] = instruction_lane_mask_q[dot_y*TILE_W+dot_x];
+                            if (dot_product_valid[dot_x]) begin
+                                if (dot_type_work == DT_BF16) begin
+                                    dot_product[dot_x] = {96'b0,
+                                        f32_mul(bf16_to_f32(operand_a[dot_y*TILE_W+dot_x][15:0]),
+                                                bf16_to_f32(operand_b[dot_y*TILE_W+dot_x][15:0]))};
+                                end else if (dot_type_work == DT_F32) begin
+                                    dot_product[dot_x] = {96'b0,
+                                        f32_mul(operand_a[dot_y*TILE_W+dot_x][31:0],
+                                                operand_b[dot_y*TILE_W+dot_x][31:0])};
+                                end else begin
                                     // Multiply at 64 bits: the selected integer type is at
                                     // most 64 bits, so a 128-bit multiply only lengthens the
                                     // critical path. The 128-bit accumulator still wraps to
                                     // the selected width at the end.
                                     dot_a_64 = $signed(sign_extend_by_type(operand_a[dot_y*TILE_W+dot_x][127:0], dot_type_work));
                                     dot_b_64 = $signed(sign_extend_by_type(operand_b[dot_y*TILE_W+dot_x][127:0], dot_type_work));
-                                    dot_acc_wide = dot_acc_wide + (dot_a_64 * dot_b_64);
+                                    dot_product[dot_x] = dot_a_64 * dot_b_64;
                                 end
                             end
-                            dot_result[dot_y] = truncate_by_type(dot_acc_wide, dot_type_work);
+                        end
+                        for (dot_stage = 0; dot_stage < REDUCE_STAGES; dot_stage = dot_stage + 1) begin
+                            dot_stride = 1 << dot_stage;
+                            for (dot_col = 0; dot_col < TILE_W; dot_col = dot_col + 1) begin
+                                if (((dot_col % (2*dot_stride)) == 0) &&
+                                    (dot_col + dot_stride < TILE_W)) begin
+                                    if (dot_product_valid[dot_col] && dot_product_valid[dot_col+dot_stride]) begin
+                                        if ((dot_type_work == DT_BF16) || (dot_type_work == DT_F32)) begin
+                                            dot_product[dot_col] = {96'b0,
+                                                f32_add(dot_product[dot_col][31:0],
+                                                        dot_product[dot_col+dot_stride][31:0])};
+                                        end else begin
+                                            dot_product[dot_col] = dot_product[dot_col] + dot_product[dot_col+dot_stride];
+                                        end
+                                    end else if (!dot_product_valid[dot_col] &&
+                                                 dot_product_valid[dot_col+dot_stride]) begin
+                                        dot_product[dot_col] = dot_product[dot_col+dot_stride];
+                                        dot_product_valid[dot_col] = 1'b1;
+                                    end
+                                end
+                            end
+                        end
+                        if (dot_product_valid[0]) begin
+                            if (dot_type_work == DT_BF16)
+                                dot_result[dot_y] = {112'b0, f32_to_bf16(dot_product[0][31:0])};
+                            else if (dot_type_work == DT_F32)
+                                dot_result[dot_y] = {96'b0, dot_product[0][31:0]};
+                            else
+                                dot_result[dot_y] = truncate_by_type(dot_product[0], dot_type_work);
                         end
                     end
                 end
