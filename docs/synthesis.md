@@ -68,6 +68,42 @@ The CI run compares one PE with the default register-file/SRAM arrays mapped to 
 
 The macro path's estimated Fmax is about 1.88× the fallback result, and its standard-cell area is lower. With 64-word macros serving 16 logical addresses, it allocates 4.1× the required memory capacity; counting the macro area, total area is about 47.7% higher. This is a speed-versus-area result, not an area reduction. A smaller macro or denser memory configuration would be needed to improve both measures.
 
+## v0.3 dataflow RTL
+
+The v0.3 ISA extensions (opcodes 21–30, F32 elementwise arithmetic, and the
+`DOT_ROW`/`TRANSPOSE`/`GATHER`/`SCATTER` datapaths) change the tile area and
+timing substantially. The same Sky130HD flow was run for one PE
+(`TILE_W=1`, `TILE_H=1`, `LANES=1`) with Yosys 0.52 and the pinned Sky130HD
+TT Liberty. The SRAM22 macro path was not re-run for v0.3.
+
+| Measurement | v0.3 | v0.2 |
+|---|---:|---:|
+| Mapped standard-cell area | 1,271,974.92 µm² | 780,806.36 µm² |
+| Mapped standard-cell instances | 182,490 | 104,691 |
+| Sequential standard-cell instances | 5,482 | 5,477 |
+| Abstract 16×132 memories | 2 | 2 |
+| Worst register-to-register slack at 100 ns | -2,071.4563 ns | 10.2986 ns |
+| Derived pre-layout Fmax | 0.461 MHz | 11.148 MHz |
+
+The area increase is about 63%, and the worst slack moves from met to a
+2.07 µs violation. The critical path is about 5,000 logic levels and is
+dominated by majority-gate (multiplier) cells. The likely source is the
+serial 16-term F32/BF16 `DOT_ROW` multiply-accumulate, which is computed
+combinationally in one `ST_EXEC` stage; the integer `DOT_ROW` multiply was
+restricted to 64-bit operands, but that alone did not change the worst path.
+`TRANSPOSE` (a 256:1 per-lane mux) and `GATHER`/`SCATTER` (per-lane SRAM
+address decode) also add combinational logic.
+
+The v0.2 numbers above came from the CI flow with its own Yosys and OpenSTA
+versions. The v0.2 baseline was re-run with the same local tools and gave
+780,712.52 µm², 102,690 instances, and 14.9190 ns slack (11.753 MHz), so the
+comparison is consistent.
+
+Pipelining the `DOT_ROW` accumulation (or reducing its serial depth) is
+required before v0.3 can meet a practical clock. The functional RTL, Python
+model, and RTL co-verification are unaffected: the v0.3 changes match the
+Python model for all 8,192 state words.
+
 ## Timing and area interpretation
 
 Yosys reports the sum of mapped standard-cell areas. The current netlist contains 5,477 sequential cells, including enabled flip-flops; the earlier count of 4,225 came from the old RTL. The current worst path has 88.3604 ns data arrival and 10.2986 ns slack. The RTL names are hidden in the STA netlist, so this report does not tie that path to a specific source signal.

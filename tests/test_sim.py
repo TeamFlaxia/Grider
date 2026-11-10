@@ -168,6 +168,64 @@ class TileEmulatorTests(unittest.TestCase):
         tile.step(Instruction(Opcode.MAC, dst=3, src_a=0, src_b=1, dtype=DataType.F32))
         self.assertAlmostEqual(tile.read_register(3)[0], 1.0 + 1.5 * 2.25)
 
+    def test_f32_add_round_to_nearest_even(self):
+        tile = Tile()
+        tile.load_register(0, [1.0] * 256, DataType.F32)
+        tile.load_register(1, [2.0 ** -24] * 256, DataType.F32)
+        tile.step(Instruction(Opcode.ADD, dst=2, src_a=0, src_b=1, dtype=DataType.F32))
+        self.assertEqual(tile.read_register_raw(2)[0][0], 0x3F800000)
+        tile.load_register(1, [3 * 2.0 ** -24] * 256, DataType.F32)
+        tile.step(Instruction(Opcode.ADD, dst=2, src_a=0, src_b=1, dtype=DataType.F32))
+        self.assertEqual(tile.read_register_raw(2)[0][0], 0x3F800002)
+
+    def test_f32_sub_mul_and_mac_bits(self):
+        tile = Tile()
+        tile.load_register(0, [1.5] * 256, DataType.F32)
+        tile.load_register(1, [0.5] * 256, DataType.F32)
+        tile.step(Instruction(Opcode.SUB, dst=2, src_a=0, src_b=1, dtype=DataType.F32))
+        self.assertEqual(tile.read_register_raw(2)[0][0], 0x3F800000)
+        tile.step(Instruction(Opcode.MUL, dst=3, src_a=0, src_b=1, dtype=DataType.F32))
+        self.assertEqual(tile.read_register_raw(3)[0][0], 0x3F400000)
+        tile.load_register(2, [1.0] * 256, DataType.F32)
+        tile.load_register(1, [2.0] * 256, DataType.F32)
+        tile.step(Instruction(Opcode.MAC, dst=2, src_a=0, src_b=1, dtype=DataType.F32))
+        self.assertEqual(tile.read_register_raw(2)[0][0], 0x40800000)
+
+    def test_f32_overflow_and_subnormal(self):
+        tile = Tile()
+        tile.load_register(0, [3.4e38] * 256, DataType.F32)
+        tile.load_register(1, [10.0] * 256, DataType.F32)
+        tile.step(Instruction(Opcode.MUL, dst=2, src_a=0, src_b=1, dtype=DataType.F32))
+        self.assertEqual(tile.read_register_raw(2)[0][0], 0x7F800000)
+        tile.load_register(0, [1e-40] * 256, DataType.F32)
+        raw = tile.read_register_raw(0)[0][0]
+        tile.step(Instruction(Opcode.ADD, dst=3, src_a=0, src_b=0, dtype=DataType.F32))
+        self.assertEqual(tile.read_register_raw(3)[0][0], (raw * 2) & 0xFFFFFFFF)
+
+    def test_f32_nan_and_min_max(self):
+        tile = Tile()
+        tile.load_register(0, [float("nan")] * 256, DataType.F32)
+        tile.load_register(1, [1.0] * 256, DataType.F32)
+        tile.step(Instruction(Opcode.ADD, dst=2, src_a=0, src_b=1, dtype=DataType.F32))
+        self.assertEqual(tile.read_register_raw(2)[0][0], 0x7FC00000)
+        tile.step(Instruction(Opcode.MAX, dst=3, src_a=0, src_b=1, dtype=DataType.F32))
+        self.assertEqual(tile.read_register_raw(3)[0][0], 0x7FC00000)
+        tile.load_register(0, [-0.0] * 256, DataType.F32)
+        tile.load_register(1, [0.0] * 256, DataType.F32)
+        tile.step(Instruction(Opcode.MIN, dst=4, src_a=0, src_b=1, dtype=DataType.F32))
+        self.assertEqual(tile.read_register_raw(4)[0][0], 0x80000000)
+
+    def test_f32_reduction_scan_dot(self):
+        tile = Tile()
+        tile.load_register(0, [1.0] * 256, DataType.F32)
+        tile.load_register(1, [2.0] * 256, DataType.F32)
+        tile.step(Instruction(Opcode.REDUCE_SUM, dst=2, src_a=0, dtype=DataType.F32))
+        self.assertEqual(tile.read_register_raw(2)[0][0], 0x41800000)
+        tile.step(Instruction(Opcode.SCAN_SUM, dst=3, src_a=0, dtype=DataType.F32))
+        self.assertEqual(tile.read_register_raw(3)[15][0], 0x41800000)
+        tile.step(Instruction(Opcode.DOT_ROW, dst=4, src_a=0, src_b=1, dtype=DataType.F32))
+        self.assertEqual(tile.read_register_raw(4)[0][0], 0x42000000)
+
 
 if __name__ == "__main__":
     unittest.main()

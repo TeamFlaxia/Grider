@@ -16,6 +16,10 @@ examples:
 	python -m grider.examples.layer_norm
 	python -m grider.examples.attention
 	python -m grider.examples.mlp
+	python -m grider.examples.attention16
+	python -m grider.examples.rms_norm
+	python -m grider.examples.render_blur
+	python -m grider.examples.render_blend
 
 
 benchmark:

@@ -2,7 +2,7 @@
 
 # Grider TODO
 
-最終更新: 2026-11-08
+最終更新: 2026-11-10
 
 ## 完了
 
@@ -22,6 +22,11 @@
 - [x] ISA v0.3セル・データフロー拡張（AI/描画GPU）
   - `TRANSPOSE`、`REDUCE_SUM_COL`/`REDUCE_MAX_COL`、`SCAN_SUM`、`DOT_ROW`、`GATHER`/`SCATTER`、`ROW/COL_BROADCAST`、整数`DIV`、F32 elementwiseを追加。Python/RTLの全レジスタ/SRAM一致を`verify_rtl`で確認。
   - `grider.kernels`にRMSNorm/SiLU/SwiGLU/RoPE/conv2d/histogram/top-k、`grider.render`にblur/Sobel/bilinear/blend/barycentric/Lambertを追加。`grider.dataflow`にAI/描画パイプライン見積を追加。`lowering`にtranspose/QK loweringを追加。
+- [x] v0.3のPPA評価と検証フォローアップ
+  - Sky130HD標準セルパスで1 PEを合成/STA。面積1,271,974.92 µm²、Fmax 0.461 MHz（v0.2比で面積+63%、大幅なタイミング悪化）。`docs/synthesis.md`に記録。
+  - PythonのF32演算をビット正確なIEEE-754参照モデルに置き換え、Python/RTL全8,192ワード一致を確認。
+  - `Makefile`の`examples`にv0.3のexamplesを追加し、CIで実行。
+  - `DOT_ROW`の整数乗算を64bitに制限（I64以下の型に対して128bit乗算は不要）。
 
 ## 進行中
 
@@ -32,6 +37,11 @@
 - [ ] マルチタイル化・耐故障設計
   - [x] マルチタイル機能プロトタイプは完了。
   - [ ] 故障検出、迂回、タイル隔離、縮退動作は未設計。
+- [ ] v0.3のクリティカルパス改善
+  - [x] 1 PE合成でcritical pathが約5,000段、maj3（乗算器）支配であることを特定。
+  - [ ] `DOT_ROW`のF32/BF16直列乗算加算（16段）をパイプライン化またはツリー化し、Fmaxを回復する。
+  - [ ] `TRANSPOSE`/`GATHER`/`SCATTER`の組み合わせ論理を評価し、必要に応じてパイプライン化。
+  - [ ] SRAM22マクロパスのv0.3評価。
 
 ## 未着手 / 外部条件待ち
 
@@ -44,5 +54,5 @@
 
 ## 次の実装項目
 
-対象FPGAが決まるまでは、Reduction treeの境界ケースと整数overflowを拡充し、合成可能性・面積の見積もり方法を整える。
+対象FPGAが決まるままでも、v0.3の`DOT_ROW`クリティカルパス対策（パイプライン化/ツリー化）とSRAM22パス評価を進める。
 

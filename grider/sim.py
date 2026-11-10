@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+from fractions import Fraction
 import math
 import struct
 from typing import Iterable, Sequence
@@ -187,6 +188,135 @@ def _f32_arithmetic_bits(value: float) -> int:
     return bits
 
 
+_F32_SIGN_BIT = 0x80000000
+_F32_INFINITY = 0x7F800000
+_F32_QUIET_NAN = 0x7FC00000
+_F32_EXPONENT_MASK = 0x7F800000
+_F32_FRACTION_MASK = 0x007FFFFF
+
+
+def _f32_is_nan(bits: int) -> bool:
+    return (bits & _F32_EXPONENT_MASK) == _F32_EXPONENT_MASK and (bits & _F32_FRACTION_MASK) != 0
+
+
+def _f32_is_inf(bits: int) -> bool:
+    return (bits & _F32_EXPONENT_MASK) == _F32_EXPONENT_MASK and (bits & _F32_FRACTION_MASK) == 0
+
+
+def _f32_is_zero(bits: int) -> bool:
+    return (bits & 0x7FFFFFFF) == 0
+
+
+def _f32_exact(bits: int) -> Fraction:
+    """Return the exact value of a finite binary32 bit pattern."""
+    sign = -1 if bits & _F32_SIGN_BIT else 1
+    exponent = (bits >> 23) & 0xFF
+    fraction = bits & _F32_FRACTION_MASK
+    if exponent == 0:
+        return Fraction(sign * fraction, 1 << 149)
+    mantissa = (1 << 23) | fraction
+    power = exponent - 127 - 23
+    if power >= 0:
+        return Fraction(sign * mantissa * (1 << power))
+    return Fraction(sign * mantissa, 1 << -power)
+
+
+def _f32_round(value: Fraction) -> int:
+    """Round an exact value to binary32 using round-to-nearest, ties-to-even."""
+    if value == 0:
+        return 0
+    negative = value < 0
+    magnitude = -value if negative else value
+    sign_bit = _F32_SIGN_BIT if negative else 0
+    if magnitude >= Fraction(2) ** 128:
+        return sign_bit | _F32_INFINITY
+    exponent = magnitude.numerator.bit_length() - magnitude.denominator.bit_length()
+    if magnitude < Fraction(2) ** exponent:
+        exponent -= 1
+    elif magnitude >= Fraction(2) ** (exponent + 1):
+        exponent += 1
+    if exponent < -126:
+        quantum = Fraction(2) ** -149
+        significand = magnitude / quantum
+        whole = significand.numerator // significand.denominator
+        remainder = significand - whole
+        if remainder > Fraction(1, 2) or (remainder == Fraction(1, 2) and (whole & 1)):
+            whole += 1
+        if whole >= (1 << 23):
+            return sign_bit | (1 << 23)
+        return sign_bit | whole
+    quantum = Fraction(2) ** (exponent - 23)
+    significand = magnitude / quantum
+    whole = significand.numerator // significand.denominator
+    remainder = significand - whole
+    if remainder > Fraction(1, 2) or (remainder == Fraction(1, 2) and (whole & 1)):
+        whole += 1
+    if whole >= (1 << 24):
+        whole >>= 1
+        exponent += 1
+        if exponent > 127:
+            return sign_bit | _F32_INFINITY
+    return sign_bit | ((exponent + 127) << 23) | (whole - (1 << 23))
+
+
+def _f32_add_bits(a_bits: int, b_bits: int) -> int:
+    if _f32_is_nan(a_bits) or _f32_is_nan(b_bits):
+        return _F32_QUIET_NAN
+    if _f32_is_inf(a_bits) or _f32_is_inf(b_bits):
+        if (_f32_is_inf(a_bits) and _f32_is_inf(b_bits)
+                and (a_bits & _F32_SIGN_BIT) != (b_bits & _F32_SIGN_BIT)):
+            return _F32_QUIET_NAN
+        return a_bits if _f32_is_inf(a_bits) else b_bits
+    if _f32_is_zero(a_bits) and _f32_is_zero(b_bits):
+        return (a_bits & b_bits) & _F32_SIGN_BIT
+    return _f32_round(_f32_exact(a_bits) + _f32_exact(b_bits))
+
+
+def _f32_sub_bits(a_bits: int, b_bits: int) -> int:
+    return _f32_add_bits(a_bits, b_bits ^ _F32_SIGN_BIT)
+
+
+def _f32_mul_bits(a_bits: int, b_bits: int) -> int:
+    if _f32_is_nan(a_bits) or _f32_is_nan(b_bits):
+        return _F32_QUIET_NAN
+    sign_bit = _F32_SIGN_BIT if (a_bits & _F32_SIGN_BIT) != (b_bits & _F32_SIGN_BIT) else 0
+    if _f32_is_inf(a_bits) or _f32_is_inf(b_bits):
+        if _f32_is_zero(a_bits) or _f32_is_zero(b_bits):
+            return _F32_QUIET_NAN
+        return sign_bit | _F32_INFINITY
+    if _f32_is_zero(a_bits) or _f32_is_zero(b_bits):
+        return sign_bit
+    return _f32_round(_f32_exact(a_bits) * _f32_exact(b_bits))
+
+
+def _f32_less_than(a_bits: int, b_bits: int) -> bool:
+    a_zero = _f32_is_zero(a_bits)
+    b_zero = _f32_is_zero(b_bits)
+    if a_zero and b_zero:
+        return False
+    a_negative = bool(a_bits & _F32_SIGN_BIT)
+    b_negative = bool(b_bits & _F32_SIGN_BIT)
+    if a_negative != b_negative:
+        return a_negative
+    magnitude_a = a_bits & 0x7FFFFFFF
+    magnitude_b = b_bits & 0x7FFFFFFF
+    if a_negative:
+        return magnitude_a > magnitude_b
+    return magnitude_a < magnitude_b
+
+
+def _f32_min_bits(a_bits: int, b_bits: int) -> int:
+    if _f32_is_nan(a_bits) or _f32_is_nan(b_bits):
+        return _F32_QUIET_NAN
+    return b_bits if _f32_less_than(b_bits, a_bits) else a_bits
+
+
+def _f32_max_bits(a_bits: int, b_bits: int) -> int:
+    if _f32_is_nan(a_bits) or _f32_is_nan(b_bits):
+        return _F32_QUIET_NAN
+    return b_bits if _f32_less_than(a_bits, b_bits) else a_bits
+
+
 def f32_to_float(value: int) -> float:
     return struct.unpack(">f", struct.pack(">I", value & 0xFFFFFFFF))[0]
 
@@ -337,15 +467,21 @@ class Tile:
                             if left is None:
                                 partial[start] = right
                             elif right is not None:
-                                left_value = _decode(left, out_type)
-                                right_value = _decode(right, out_type)
-                                value = left_value + right_value if is_sum else max(left_value, right_value)
-                                if out_type == DataType.BF16:
-                                    payload = float_to_bf16(float(value))
-                                elif out_type == DataType.F32:
-                                    payload = _f32_arithmetic_bits(float(value))
+                                if out_type == DataType.F32:
+                                    left_bits = left.payload & 0xFFFFFFFF
+                                    right_bits = right.payload & 0xFFFFFFFF
+                                    if is_sum:
+                                        payload = _f32_add_bits(left_bits, right_bits)
+                                    else:
+                                        payload = _f32_max_bits(left_bits, right_bits)
                                 else:
-                                    payload = _pack(int(value), out_type)
+                                    left_value = _decode(left, out_type)
+                                    right_value = _decode(right, out_type)
+                                    value = left_value + right_value if is_sum else max(left_value, right_value)
+                                    if out_type == DataType.BF16:
+                                        payload = float_to_bf16(float(value))
+                                    else:
+                                        payload = _pack(int(value), out_type)
                                 partial[start] = _Register(payload, out_type)
                         stride *= 2
                     result = partial[0]
@@ -371,27 +507,29 @@ class Tile:
                         continue
                     value = _decode(self._rf[lane][insn.src_a], out_type)
                     if not has_value:
-                        if out_type == DataType.BF16:
+                        if out_type == DataType.F32:
+                            payload = self._rf[lane][insn.src_a].payload & 0xFFFFFFFF
+                        elif out_type == DataType.BF16:
                             payload = float_to_bf16(float(value))
-                        elif out_type == DataType.F32:
-                            payload = _f32_arithmetic_bits(float(value))
                         else:
                             payload = _pack(int(value), out_type)
                         running = _Register(payload, out_type)
                         has_value = True
                     else:
-                        prior = _decode(running, out_type)
-                        summed = float(prior) + float(value)
-                        if out_type == DataType.BF16:
-                            # NaN propagates through BF16 scan like reductions.
-                            if math.isnan(summed):
-                                payload = 0x7FC0
-                            else:
-                                payload = float_to_bf16(summed)
-                        elif out_type == DataType.F32:
-                            payload = _f32_arithmetic_bits(summed)
+                        if out_type == DataType.F32:
+                            payload = _f32_add_bits(running.payload & 0xFFFFFFFF,
+                                                    self._rf[lane][insn.src_a].payload & 0xFFFFFFFF)
                         else:
-                            payload = _pack(int(int(prior) + int(value)), out_type)
+                            prior = _decode(running, out_type)
+                            summed = float(prior) + float(value)
+                            if out_type == DataType.BF16:
+                                # NaN propagates through BF16 scan like reductions.
+                                if math.isnan(summed):
+                                    payload = 0x7FC0
+                                else:
+                                    payload = float_to_bf16(summed)
+                            else:
+                                payload = _pack(int(int(prior) + int(value)), out_type)
                         running = _Register(payload, out_type)
                     self._rf[lane][insn.dst] = _Register(running.payload, running.dtype)
             self.cycles += 1
@@ -406,19 +544,20 @@ class Tile:
                 out_type = dtype if dtype is not None else self._rf[active[0]][insn.src_a].dtype
                 if not _supports_dtype(op, out_type):
                     continue
-                if out_type in (DataType.BF16, DataType.F32):
-                    acc = 0.0
+                if out_type == DataType.F32:
+                    acc_bits = 0
                     for lane in active:
-                        av = float(_decode(self._rf[lane][insn.src_a], out_type))
-                        bv = float(_decode(self._rf[lane][insn.src_b], out_type))
-                        # RTL rounds the product to F32 before the add.
-                        prod = f32_to_float(_f32_arithmetic_bits(float(av) * float(bv)))
-                        acc = f32_to_float(_f32_arithmetic_bits(acc + float(prod)))
-                    if out_type == DataType.BF16:
-                        payload = float_to_bf16(float(acc))
-                    else:
-                        payload = _f32_arithmetic_bits(float(acc))
-                    result = _Register(payload, out_type)
+                        a_bits = self._rf[lane][insn.src_a].payload & 0xFFFFFFFF
+                        b_bits = self._rf[lane][insn.src_b].payload & 0xFFFFFFFF
+                        acc_bits = _f32_add_bits(acc_bits, _f32_mul_bits(a_bits, b_bits))
+                    result = _Register(acc_bits, DataType.F32)
+                elif out_type == DataType.BF16:
+                    acc_bits = 0
+                    for lane in active:
+                        a_bits = (self._rf[lane][insn.src_a].payload & 0xFFFF) << 16
+                        b_bits = (self._rf[lane][insn.src_b].payload & 0xFFFF) << 16
+                        acc_bits = _f32_add_bits(acc_bits, _f32_mul_bits(a_bits, b_bits))
+                    result = _Register(float_to_bf16(f32_to_float(acc_bits)), DataType.BF16)
                 else:
                     acc = 0
                     for lane in active:
@@ -519,6 +658,37 @@ class Tile:
 
             # Arithmetic inherits one common operand type. SEL is handled
             # above because its inherited result type comes from src_b.
+            if out_type == DataType.F32:
+                a_bits = a.payload & 0xFFFFFFFF
+                b_bits = b.payload & 0xFFFFFFFF
+                if op == Opcode.ADD:
+                    result_bits = _f32_add_bits(a_bits, b_bits)
+                elif op == Opcode.SUB:
+                    result_bits = _f32_sub_bits(a_bits, b_bits)
+                elif op == Opcode.MUL:
+                    result_bits = _f32_mul_bits(a_bits, b_bits)
+                elif op == Opcode.MAC:
+                    acc_bits = self._rf[lane][insn.dst].payload & 0xFFFFFFFF
+                    result_bits = _f32_add_bits(acc_bits, _f32_mul_bits(a_bits, b_bits))
+                elif op == Opcode.MIN:
+                    result_bits = _f32_min_bits(a_bits, b_bits)
+                elif op == Opcode.MAX:
+                    result_bits = _f32_max_bits(a_bits, b_bits)
+                else:
+                    continue
+                writes.append((lane, _Register(result_bits, DataType.F32)))
+                continue
+
+            if out_type == DataType.BF16 and op == Opcode.MAC:
+                accumulator = self._rf[lane][insn.dst]
+                acc_bits = (accumulator.payload & 0xFFFFFFFF if accumulator.dtype == DataType.F32
+                            else (accumulator.payload & 0xFFFF) << 16)
+                a_bits = (a.payload & 0xFFFF) << 16
+                b_bits = (b.payload & 0xFFFF) << 16
+                result_bits = _f32_add_bits(acc_bits, _f32_mul_bits(a_bits, b_bits))
+                writes.append((lane, _Register(result_bits, DataType.F32)))
+                continue
+
             av = _decode(a, out_type)
             bv = _decode(b, out_type)
             if op == Opcode.ADD:
@@ -532,25 +702,11 @@ class Tile:
                 if int(bv) == 0:
                     result = 0
                 else:
-                    result = int(int(av) / int(bv)) if (int(av) % int(bv) == 0 or (int(av) < 0) == (int(bv) < 0)) else int(int(av) / int(bv))
-                    # Use truncating semantics via abs.
                     result = abs(int(av)) // abs(int(bv))
                     if (int(av) < 0) != (int(bv) < 0):
                         result = -result
             elif op == Opcode.MAC:
                 accumulator = self._rf[lane][insn.dst]
-                if out_type == DataType.BF16:
-                    old = _decode(accumulator, DataType.F32 if accumulator.dtype == DataType.F32 else DataType.BF16)
-                    prod = f32_to_float(_f32_arithmetic_bits(float(av) * float(bv)))
-                    result_bits = _f32_arithmetic_bits(float(old) + float(prod))
-                    writes.append((lane, _Register(result_bits, DataType.F32)))
-                    continue
-                if out_type == DataType.F32:
-                    old = _decode(accumulator, DataType.F32)
-                    prod = f32_to_float(_f32_arithmetic_bits(float(av) * float(bv)))
-                    result_bits = _f32_arithmetic_bits(float(old) + float(prod))
-                    writes.append((lane, _Register(result_bits, DataType.F32)))
-                    continue
                 old = _decode(accumulator, out_type)
                 result = old + av * bv
             elif op == Opcode.AND:
@@ -569,16 +725,15 @@ class Tile:
                 else:
                     result = a.payload >> shift
             elif op == Opcode.MIN:
-                result = math.nan if out_type in (DataType.BF16, DataType.F32) and (math.isnan(float(av)) or math.isnan(float(bv))) else min(av, bv)
+                result = math.nan if out_type == DataType.BF16 and (math.isnan(av) or math.isnan(bv)) else min(av, bv)
             elif op == Opcode.MAX:
-                result = math.nan if out_type in (DataType.BF16, DataType.F32) and (math.isnan(float(av)) or math.isnan(float(bv))) else max(av, bv)
+                result = math.nan if out_type == DataType.BF16 and (math.isnan(av) or math.isnan(bv)) else max(av, bv)
             else:
                 # Unknown v0 opcodes are defined as no-ops above.
                 continue
 
             payload = (float_to_bf16(float(result)) if out_type == DataType.BF16 else
-                       (_f32_arithmetic_bits(float(result)) if out_type == DataType.F32 else
-                        _pack(int(result), out_type)))
+                       _pack(int(result), out_type))
             writes.append((lane, _Register(payload, out_type)))
 
         for lane, value in writes:
@@ -687,20 +842,21 @@ def gemm16(a: Sequence[Sequence[int | float]], b: Sequence[Sequence[int | float]
     for row in range(16):
         output_row: list[int | float] = []
         for col in range(16):
-            acc: int | float = 0.0 if dtype == DataType.BF16 else 0
+            acc_bits = 0
             for k in range(16):
                 if dtype == DataType.BF16:
-                    av = bf16_to_float(float_to_bf16(float(a[row][k])))
-                    bv = bf16_to_float(float_to_bf16(float(b[k][col])))
+                    a_bits = float_to_bf16(float(a[row][k])) << 16
+                    b_bits = float_to_bf16(float(b[k][col])) << 16
+                    acc_bits = _f32_add_bits(acc_bits, _f32_mul_bits(a_bits, b_bits))
                 else:
                     width = _width(dtype)
                     av = _signed(int(a[row][k]), width)
                     bv = _signed(int(b[k][col]), width)
-                if dtype == DataType.BF16:
-                    acc = f32_to_float(_f32_arithmetic_bits(float(acc) + av * bv))
-                else:
-                    acc += av * bv
-            output_row.append(bf16_to_float(float_to_bf16(float(acc))) if dtype == DataType.BF16 else _signed(int(acc), 32))
+                    acc_bits += av * bv
+            if dtype == DataType.BF16:
+                output_row.append(bf16_to_float(float_to_bf16(f32_to_float(acc_bits))))
+            else:
+                output_row.append(_signed(int(acc_bits), 32))
         result.append(output_row)
     return result
 

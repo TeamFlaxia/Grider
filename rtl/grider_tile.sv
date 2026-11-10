@@ -342,10 +342,8 @@ module grider_tile #(
     logic [3:0] dot_type_work;
     logic dot_has;
     logic [31:0] dot_prod;
-    integer perm_x;
-    integer perm_y;
-    integer perm_sx;
-    integer perm_sy;
+    logic signed [63:0] dot_a_64;
+    logic signed [63:0] dot_b_64;
     integer perm_src;
     integer bc_lane;
     integer col_stage;
@@ -1168,6 +1166,13 @@ module grider_tile #(
         dot_type_work = DT_I32;
         dot_has = 1'b0;
         dot_prod = '0;
+        dot_a_64 = '0;
+        dot_b_64 = '0;
+        col_stage = 0;
+        col_stride = 0;
+        col_col = 0;
+        dot_y = 0;
+        dot_x = 0;
 
         if (state == ST_EXEC) begin
             if ((instruction_opcode_q == OP_REDUCE_SUM_COL) ||
@@ -1363,9 +1368,13 @@ module grider_tile #(
                             dot_acc_wide = '0;
                             for (dot_x = 0; dot_x < TILE_W; dot_x = dot_x + 1) begin
                                 if (instruction_lane_mask_q[dot_y*TILE_W+dot_x]) begin
-                                    dot_acc_wide = dot_acc_wide +
-                                        ($signed(sign_extend_by_type(operand_a[dot_y*TILE_W+dot_x][127:0], dot_type_work)) *
-                                         $signed(sign_extend_by_type(operand_b[dot_y*TILE_W+dot_x][127:0], dot_type_work)));
+                                    // Multiply at 64 bits: the selected integer type is at
+                                    // most 64 bits, so a 128-bit multiply only lengthens the
+                                    // critical path. The 128-bit accumulator still wraps to
+                                    // the selected width at the end.
+                                    dot_a_64 = $signed(sign_extend_by_type(operand_a[dot_y*TILE_W+dot_x][127:0], dot_type_work));
+                                    dot_b_64 = $signed(sign_extend_by_type(operand_b[dot_y*TILE_W+dot_x][127:0], dot_type_work));
+                                    dot_acc_wide = dot_acc_wide + (dot_a_64 * dot_b_64);
                                 end
                             end
                             dot_result[dot_y] = truncate_by_type(dot_acc_wide, dot_type_work);
@@ -1510,6 +1519,8 @@ module grider_tile #(
             y = 0;
             nx = 0;
             ny = 0;
+            perm_src = 0;
+            bc_lane = 0;
 
             if (state == ST_EXEC && instruction_lane_mask_q[lane] &&
                 ((instruction_dtype_q == DT_INHERIT) || dtype_is_valid(instruction_dtype_q) ||
