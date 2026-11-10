@@ -1,16 +1,16 @@
 <!-- SPDX-License-Identifier: CERN-OHL-W-2.0 -->
 
-# Grider v0.2 instruction semantics
+# Grider v0.3 instruction semantics
 
-This document defines the architectural behavior shared by the Python model and the RTL. Version 0.2 adds FP32 accumulation for BF16 MAC and an explicit BF16/FP32 conversion at opcode 20. Version 0.1 added row reductions at opcodes 18 and 19. The Python `Tile.step` API represents an already accepted instruction; it does not model host-port backpressure timing.
+This document defines the architectural behavior shared by the Python model and the RTL. Version 0.3 keeps the 16×16 cellular tile, lane mask, neighbor halos, and row reductions from v0.2 and adds dataflow permutes plus F32 elementwise arithmetic (opcodes 21–30) and a reserved opcode 31. Version 0.2 added FP32 accumulation for BF16 MAC and an explicit BF16/FP32 conversion at opcode 20. Version 0.1 added row reductions at opcodes 18 and 19. The Python `Tile.step` API represents an already accepted instruction; it does not model host-port backpressure timing.
 
 ## Encoding and issue
 
-- Opcodes 0 through 20 are defined below. Reserved opcodes 21 through 31 are no-ops.
+- Opcodes 0 through 30 are defined below. Reserved opcode 31 is a no-op.
 - Data type tags 0 through 8 are defined. Tag `0xf` means inherit the source type described below; tags 9 through 14 are reserved.
 - A reserved opcode or reserved type tag completes as a no-op: registers and SRAM remain unchanged. The RTL still pulses `instruction_done` for a valid/ready issue.
 - An instruction is accepted on a rising edge when `rst_n && instruction_valid && instruction_ready`. `instruction_ready` is high only while the tile is idle and no host read or write request is active. It stays low while an accepted instruction is in flight. A mesh broadcasts only when every tile is ready, so a stalled issue has no partial side effects. Keep `instruction_valid` asserted until the accepting edge.
-- The RTL latches the instruction at acceptance, then reads operands, executes, and writes back. The single-port register file serializes source reads: no-read instructions take 2 cycles from acceptance to completion; one-read instructions take 3; two-read instructions take 4; three-read instructions take 5. `MAC` and `SEL` use three reads. `MOVI` with an inherited type uses one read.
+- The RTL latches the instruction at acceptance, then reads operands, executes, and writes back. The single-port register file serializes source reads: no-read instructions take 2 cycles from acceptance to completion; one-read instructions take 3; two-read instructions take 4; three-read instructions take 5. `MAC` and `SEL` use three reads. `MOVI` with an inherited type uses one read. `GATHER` uses one RF read plus one SRAM read (4 cycles); `SCATTER` and `DIV`/`DOT_ROW` use two RF reads (4 cycles).
 - `instruction_done` is a one-cycle completion pulse after writeback, not an acceptance pulse. It is high after the edge that commits the instruction and low after the following edge unless another instruction retires. With no host request, `instruction_ready` returns high in the cycle of `instruction_done`, so the next instruction may be accepted on the following rising edge.
 - Host writes are accepted on a rising edge when `host_write_enable && host_access_ready`. Host reads use `host_read_enable && host_access_ready`; `host_read_valid` and the data/tag outputs are valid one cycle later. Avoid asserting read and write together; if both are high, the write takes priority.
 - Inactive lanes preserve their register and SRAM state.
@@ -38,6 +38,17 @@ This document defines the architectural behavior shared by the Python model and 
 | 18 | `REDUCE_SUM` |
 | 19 | `REDUCE_MAX` |
 | 20 | `CONVERT` |
+| 21 | `TRANSPOSE` |
+| 22 | `REDUCE_SUM_COL` |
+| 23 | `REDUCE_MAX_COL` |
+| 24 | `SCAN_SUM` |
+| 25 | `GATHER` |
+| 26 | `SCATTER` |
+| 27 | `ROW_BROADCAST` |
+| 28 | `COL_BROADCAST` |
+| 29 | `DIV` |
+| 30 | `DOT_ROW` |
+| 31 | reserved |
 
 ## Payload representation
 
@@ -59,11 +70,11 @@ For arithmetic and `MOVI`, an explicit tag selects the operation and result type
 
 `MOV` copies `src_a` and preserves its tag; its type field is ignored. `SEL` tests whether the raw `src_a` payload is nonzero, then copies the selected `src_b` or `src_c` payload into the result type. The selected payload is reinterpreted and truncated to that type; it is not numerically converted.
 
-`NEIGHBOR`, `LOAD`, and `STORE` preserve the source or stored type tag and ignore the type field. A missing mesh neighbor returns zero with the current lane's `src_a` tag.
+`NEIGHBOR`, `LOAD`, `STORE`, `TRANSPOSE`, `GATHER`, `SCATTER`, `ROW_BROADCAST`, and `COL_BROADCAST` preserve the source or stored type tag and ignore the type field. A missing mesh neighbor returns zero with the current lane's `src_a` tag.
 
 ## Defined operations
 
-- `ADD`, `SUB`, `MUL`, `MAC`, `MIN`, and `MAX` are defined for I4, I8, I16, I32, I64, and BF16. Using U128 or PRED with these operations is a no-op.
+- `ADD`, `SUB`, `MUL`, `MAC`, `MIN`, and `MAX` are defined for I4, I8, I16, I32, I64, BF16, and F32. Using U128 or PRED with these operations is a no-op. F32 `MAC` takes two F32 inputs and an F32 accumulator.
 - `AND`, `OR`, `XOR`, `SHL`, and `SHR` operate on payload bits for all defined types. Results are normalized to the selected type.
 - Shift counts use the low seven bits of the raw `src_b` payload. `SHR` is arithmetic for signed integer types and logical for BF16, U128, and PRED.
 - `SEL` uses `src_a` as a nonzero predicate, `src_b` as the true value, and `src_c` as the false value.
@@ -71,11 +82,15 @@ For arithmetic and `MOVI`, an explicit tag selects the operation and result type
 - `LOAD` and `STORE` use `imm[3:0]` as the local SRAM address. Higher immediate bits are ignored.
 - `MOVI` uses the immediate's low bits and normalizes them to the selected type.
 - `CONVERT` converts between BF16 and F32. Its dtype field selects the destination format; the source format comes from the `src_a` type tag. Other source/destination combinations complete as no-ops.
-- F32 is an accumulator/result storage format for BF16 MAC. General F32 arithmetic opcodes are not defined in v0.2.
 - `REDUCE_SUM` and `REDUCE_MAX` reduce one 16-cell row within a tile. Columns are paired as (0,1), (2,3), and so on, then combined in a balanced tree with strides 2, 4, and 8.
-- The lane mask selects both reduction inputs and destination cells. The same row result is written to each active cell in that row; inactive lanes retain their state. A row with no active lanes has no result.
-- Integer reductions wrap after each tree node at the selected width. BF16 sum rounds to BF16 at each tree node. BF16 max returns canonical quiet NaN if any active input is NaN. These opcodes support I4, I8, I16, I32, I64, and BF16; other types are no-ops.
-- An explicit type selects the reduction format. With inherited type (`0xf`), each row uses the `src_a` type of its leftmost active cell. Reductions do not cross tile boundaries.
+- `REDUCE_SUM_COL` and `REDUCE_MAX_COL` do the same down a column. `SCAN_SUM` is an inclusive prefix sum along a row (left to right) and `DOT_ROW` is the row dot product of `src_a` and `src_b`.
+- The lane mask selects both reduction inputs and destination cells. The same group result is written to each active cell in that row/column; inactive lanes retain their state. A group with no active lanes has no result. `SCAN_SUM` writes the running prefix to each active lane.
+- Integer reductions wrap after each tree node at the selected width. BF16/F32 sum rounds to BF16/F32 at each node (or prefix step). BF16/F32 max returns canonical quiet NaN (`0x7fc0` / `0x7fc00000`) if any active input is NaN. These opcodes support I4, I8, I16, I32, I64, BF16, and F32; other types are no-ops. `DOT_ROW` accumulates in F32 for BF16/F32 and wraps at the selected width for integers, then rounds BF16 outputs once.
+- An explicit type selects the reduction/scan/dot format. With inherited type (`0xf`), each row/column uses the `src_a` type of its leftmost/topmost active cell. Reductions, scans, and dots do not cross tile boundaries.
+- `TRANSPOSE` permutes one register across the 16×16 tile. `imm[2:0]` selects: 0 transpose, 1 flip-X, 2 flip-Y, 3 rotate-90-CW, 4 rotate-90-CCW, 5 anti-transpose, 6 rotate-180, 7 identity. The source is the pre-instruction snapshot.
+- `ROW_BROADCAST` copies `src_a` from column 0 of the same row. `COL_BROADCAST` copies `src_a` from row 0 of the same column.
+- `GATHER` reads cell-local SRAM at address `src_a[3:0]`. `SCATTER` writes `src_a` to cell-local SRAM at address `src_b[3:0]`. Both are lane-local (no inter-cell gather) and preserve tags.
+- `DIV` is truncating integer division for I4/I8/I16/I32/I64; division by zero yields 0. All other types are no-ops.
 
 
 

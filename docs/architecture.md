@@ -22,26 +22,28 @@ Neighbor direction is N, NE, E, SE, S, SW, W, NW (0–7). Tile and cell indices 
 | `I16`, `I32`, `I64` | signed integer | wraps to selected width |
 | `U128` | unsigned 128-bit vector | payload bit operations |
 | `PRED` | predicate | low bit, nonzero means true |
-| `F32` | IEEE-754 binary32 | BF16 MAC accumulator storage; converted explicitly to/from BF16 |
+| `F32` | IEEE-754 binary32 | BF16 MAC accumulator storage and elementwise F32 arithmetic; converted explicitly to/from BF16 |
 
-Opcodes 0–20 are defined in [ISA v0.2](isa.md). They include MOV/MOVI, arithmetic, bitwise operations, shifts, MIN/MAX/SEL, NEIGHBOR, LOAD/STORE, row reductions, and BF16/F32 conversion. Reserved opcodes and type tags are no-ops.
+Opcodes 0–30 are defined in [ISA v0.3](isa.md). They include MOV/MOVI, arithmetic, bitwise operations, shifts, MIN/MAX/SEL, NEIGHBOR, LOAD/STORE, row/column reductions, BF16/F32 conversion, TRANSPOSE, SCAN_SUM, GATHER/SCATTER, ROW/COL_BROADCAST, integer DIV, and DOT_ROW. Reserved opcode 31 and reserved type tags are no-ops.
 
-BF16 MAC stores its accumulator in F32, preserving FP32 precision across a reduction loop. The first MAC accepts an existing BF16 accumulator; subsequent MACs consume the F32 result. `CONVERT` rounds the final F32 result to BF16. BF16 row sum rounds at each tree node. BF16 max returns canonical quiet NaN if a participating input is NaN.
+BF16 MAC stores its accumulator in F32, preserving FP32 precision across a reduction loop. The first MAC accepts an existing BF16 accumulator; subsequent MACs consume the F32 result. `CONVERT` rounds the final F32 result to BF16. BF16/F32 row sums round at each tree node. BF16/F32 max returns canonical quiet NaN if a participating input is NaN.
 
-## Reduction behavior
+## Reduction and dataflow behavior
 
-`REDUCE_SUM` and `REDUCE_MAX` operate on each tile row independently; they do not cross tile boundaries. The reduction uses a balanced binary tree: adjacent pairs are combined, then groups of 4, 8, and 16 cells. The lane mask selects both participating values and destination lanes. Each active lane receives the row result; inactive cells hold their state. A row with no active lanes has no output.
+`REDUCE_SUM` and `REDUCE_MAX` operate on each tile row independently; `REDUCE_SUM_COL`/`REDUCE_MAX_COL` do the same down each column. `SCAN_SUM` is an inclusive prefix sum along each row and `DOT_ROW` is the row dot product of two registers. These operations do not cross tile boundaries. Reductions use a balanced binary tree: adjacent pairs are combined, then groups of 4, 8, and 16 cells. The lane mask selects both participating values and destination lanes. Each active lane receives the group result; inactive cells hold their state. A group with no active lanes has no output.
 
-An explicit type selector is applied to every operand and the result. With inherited type, a row uses the `src_a` tag of its leftmost active lane. Integer sums wrap at each tree node. Unsupported numeric type combinations are no-ops.
+An explicit type selector is applied to every operand and the result. With inherited type, a row/column uses the `src_a` tag of its leftmost/topmost active lane. Integer sums wrap at each tree node. Unsupported numeric type combinations are no-ops.
+
+Cellular dataflow: `TRANSPOSE` permutes a register across the tile (eight dihedral transforms), `ROW_BROADCAST`/`COL_BROADCAST` copy the edge cell down/across the row/column, `NEIGHBOR` shifts by one in eight directions (including mesh halos), and `GATHER`/`SCATTER` provide cell-local SRAM indirection for embedding/texture-style lookups.
 
 ## Python and RTL contract
 
 `grider.sim.Tile.step` models one tile instruction. `grider.sim.Mesh.step` broadcasts instructions to tiles and snapshots state for cross-tile neighbor reads. `rtl/grider_tile.sv` and `rtl/grider_mesh.sv` implement the matching interfaces.
 
-`python -m grider.verify_rtl` feeds the same instruction stream to both models and compares every register and SRAM payload/tag. It covers arithmetic, masking, SRAM, neighbor reads, and row reductions. `python -m grider.verify_mesh_rtl` checks the eight halo directions in a 2×2 RTL mesh. The RTL testbenches also check host read-valid, ready/busy behavior, instruction completion, and mesh issue. GitHub Actions runs these checks.
+`python -m grider.verify_rtl` feeds the same instruction stream to both models and compares every register and SRAM payload/tag. It covers arithmetic, masking, SRAM, neighbor reads, row/column reductions, scans, dot products, transpose, broadcasts, gather/scatter, F32 elementwise ops, and BF16/F32 dataflow. `python -m grider.verify_mesh_rtl` checks the eight halo directions in a 2×2 RTL mesh. The RTL testbenches also check host read-valid, ready/busy behavior, instruction completion, and mesh issue. GitHub Actions runs these checks.
 
 ## Kernel examples and current scope
 
-`grider.kernels` and `grider.examples` provide host-side reference kernels for matmul, row softmax, layer norm, attention, and MLP. They are not yet lowered to Grider instruction programs.
+`grider.kernels` and `grider.examples` provide host-side reference kernels for matmul, row softmax, layer norm, RMSNorm, RoPE, attention, MLP, convolution, histogram/top-k, and rendering primitives (`grider.render`: blur, Sobel, bilinear, alpha blend, barycentric, Lambert, perspective divide). `grider.lowering` lowers concrete GEMM, transpose, and QK scoring to instruction programs. See [ai_dataflow.md](ai_dataflow.md) and [rendering.md](rendering.md) for mapping strategies.
 
 The prototype has no instruction fetch unit, compiler, GEMM sequencer, performance counters, or fault-recovery logic. The RTL handles one instruction at a time through operand-read, execute, and writeback stages. Multi-source reads are serialized, so instructions do not overlap; the stages shorten the memory-to-arithmetic path but do not yet provide one-instruction-per-cycle throughput. The Python model is functional, not cycle-, area-, or power-accurate.

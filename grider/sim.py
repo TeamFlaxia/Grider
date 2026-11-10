@@ -55,6 +55,16 @@ class Opcode(IntEnum):
     REDUCE_SUM = 18
     REDUCE_MAX = 19
     CONVERT = 20
+    TRANSPOSE = 21
+    REDUCE_SUM_COL = 22
+    REDUCE_MAX_COL = 23
+    SCAN_SUM = 24
+    GATHER = 25
+    SCATTER = 26
+    ROW_BROADCAST = 27
+    COL_BROADCAST = 28
+    DIV = 29
+    DOT_ROW = 30
 
 
 @dataclass(frozen=True)
@@ -111,18 +121,32 @@ def _pack(value: int, dtype: DataType) -> int:
 
 _NUMERIC_DTYPES = frozenset({
     DataType.I4, DataType.I8, DataType.I16, DataType.I32, DataType.I64,
-    DataType.BF16,
+    DataType.BF16, DataType.F32,
+})
+_INT_DTYPES = frozenset({
+    DataType.I4, DataType.I8, DataType.I16, DataType.I32, DataType.I64,
 })
 _NUMERIC_OPS = frozenset({
     Opcode.ADD, Opcode.SUB, Opcode.MUL, Opcode.MAC, Opcode.MIN, Opcode.MAX,
-    Opcode.REDUCE_SUM, Opcode.REDUCE_MAX,
+    Opcode.REDUCE_SUM, Opcode.REDUCE_MAX, Opcode.REDUCE_SUM_COL,
+    Opcode.REDUCE_MAX_COL, Opcode.SCAN_SUM, Opcode.DOT_ROW,
+})
+# Ops that ignore their dtype field and preserve operand tags.
+_TAG_PRESERVING_OPS = frozenset({
+    Opcode.MOV, Opcode.NEIGHBOR, Opcode.LOAD, Opcode.STORE,
+    Opcode.TRANSPOSE, Opcode.GATHER, Opcode.SCATTER,
+    Opcode.ROW_BROADCAST, Opcode.COL_BROADCAST,
 })
 
 
 def _supports_dtype(op: Opcode, dtype: DataType) -> bool:
-    """Return whether the v0 ISA defines this arithmetic/type combination."""
+    """Return whether the ISA defines this arithmetic/type combination."""
     if op == Opcode.CONVERT:
         return dtype in (DataType.BF16, DataType.F32)
+    if op == Opcode.DIV:
+        return dtype in _INT_DTYPES
+    if op in _TAG_PRESERVING_OPS:
+        return True
     if op == Opcode.MAC and dtype == DataType.BF16:
         return True
     return op not in _NUMERIC_OPS or dtype in _NUMERIC_DTYPES
@@ -275,7 +299,63 @@ class Tile:
         address = immediate & (LOCAL_WORDS - 1)
         direction = immediate & 0x7
 
-        if op in (Opcode.REDUCE_SUM, Opcode.REDUCE_MAX):
+        if op in (Opcode.REDUCE_SUM, Opcode.REDUCE_MAX,
+                  Opcode.REDUCE_SUM_COL, Opcode.REDUCE_MAX_COL):
+            is_col = op in (Opcode.REDUCE_SUM_COL, Opcode.REDUCE_MAX_COL)
+            is_sum = op in (Opcode.REDUCE_SUM, Opcode.REDUCE_SUM_COL)
+            groups = 16
+            for group in range(groups):
+                if is_col:
+                    lanes = [row * self.width + group for row in range(self.height)]
+                else:
+                    lanes = [group * self.width + col for col in range(self.width)]
+                active = [lane for lane in lanes if (insn.lane_mask >> lane) & 1]
+                if not active:
+                    continue
+                out_type = dtype if dtype is not None else self._rf[active[0]][insn.src_a].dtype
+                if not _supports_dtype(op, out_type):
+                    continue
+                group_values = [self._rf[lane][insn.src_a] for lane in active]
+                has_nan = out_type in (DataType.BF16, DataType.F32) and any(
+                    math.isnan(_decode(value, out_type)) for value in group_values
+                )
+                if has_nan:
+                    nan_payload = 0x7FC0 if out_type == DataType.BF16 else 0x7FC00000
+                    result = _Register(nan_payload, out_type)
+                else:
+                    partial: list[_Register | None] = [
+                        self._rf[lane][insn.src_a] if (insn.lane_mask >> lane) & 1 else None
+                        for lane in lanes
+                    ]
+                    stride = 1
+                    while stride < len(lanes):
+                        for start in range(0, len(lanes), stride * 2):
+                            if start + stride >= len(lanes):
+                                break
+                            left = partial[start]
+                            right = partial[start + stride]
+                            if left is None:
+                                partial[start] = right
+                            elif right is not None:
+                                left_value = _decode(left, out_type)
+                                right_value = _decode(right, out_type)
+                                value = left_value + right_value if is_sum else max(left_value, right_value)
+                                if out_type == DataType.BF16:
+                                    payload = float_to_bf16(float(value))
+                                elif out_type == DataType.F32:
+                                    payload = _f32_arithmetic_bits(float(value))
+                                else:
+                                    payload = _pack(int(value), out_type)
+                                partial[start] = _Register(payload, out_type)
+                        stride *= 2
+                    result = partial[0]
+                assert result is not None
+                for lane in active:
+                    self._rf[lane][insn.dst] = _Register(result.payload, result.dtype)
+            self.cycles += 1
+            return
+
+        if op == Opcode.SCAN_SUM:
             for row in range(self.height):
                 lanes = [row * self.width + col for col in range(self.width)]
                 active = [lane for lane in lanes if (insn.lane_mask >> lane) & 1]
@@ -284,34 +364,68 @@ class Tile:
                 out_type = dtype if dtype is not None else self._rf[active[0]][insn.src_a].dtype
                 if not _supports_dtype(op, out_type):
                     continue
-                row_values = [self._rf[lane][insn.src_a] for lane in active]
-                has_nan = out_type == DataType.BF16 and any(
-                    math.isnan(_decode(value, out_type)) for value in row_values
-                )
-                if has_nan:
-                    result = _Register(0x7FC0, DataType.BF16)
+                running = _Register(0, out_type)
+                has_value = False
+                for lane in lanes:
+                    if not ((insn.lane_mask >> lane) & 1):
+                        continue
+                    value = _decode(self._rf[lane][insn.src_a], out_type)
+                    if not has_value:
+                        if out_type == DataType.BF16:
+                            payload = float_to_bf16(float(value))
+                        elif out_type == DataType.F32:
+                            payload = _f32_arithmetic_bits(float(value))
+                        else:
+                            payload = _pack(int(value), out_type)
+                        running = _Register(payload, out_type)
+                        has_value = True
+                    else:
+                        prior = _decode(running, out_type)
+                        summed = float(prior) + float(value)
+                        if out_type == DataType.BF16:
+                            # NaN propagates through BF16 scan like reductions.
+                            if math.isnan(summed):
+                                payload = 0x7FC0
+                            else:
+                                payload = float_to_bf16(summed)
+                        elif out_type == DataType.F32:
+                            payload = _f32_arithmetic_bits(summed)
+                        else:
+                            payload = _pack(int(int(prior) + int(value)), out_type)
+                        running = _Register(payload, out_type)
+                    self._rf[lane][insn.dst] = _Register(running.payload, running.dtype)
+            self.cycles += 1
+            return
+
+        if op == Opcode.DOT_ROW:
+            for row in range(self.height):
+                lanes = [row * self.width + col for col in range(self.width)]
+                active = [lane for lane in lanes if (insn.lane_mask >> lane) & 1]
+                if not active:
+                    continue
+                out_type = dtype if dtype is not None else self._rf[active[0]][insn.src_a].dtype
+                if not _supports_dtype(op, out_type):
+                    continue
+                if out_type in (DataType.BF16, DataType.F32):
+                    acc = 0.0
+                    for lane in active:
+                        av = float(_decode(self._rf[lane][insn.src_a], out_type))
+                        bv = float(_decode(self._rf[lane][insn.src_b], out_type))
+                        # RTL rounds the product to F32 before the add.
+                        prod = f32_to_float(_f32_arithmetic_bits(float(av) * float(bv)))
+                        acc = f32_to_float(_f32_arithmetic_bits(acc + float(prod)))
+                    if out_type == DataType.BF16:
+                        payload = float_to_bf16(float(acc))
+                    else:
+                        payload = _f32_arithmetic_bits(float(acc))
+                    result = _Register(payload, out_type)
                 else:
-                    partial: list[_Register | None] = [
-                        self._rf[lane][insn.src_a] if (insn.lane_mask >> lane) & 1 else None
-                        for lane in lanes
-                    ]
-                    stride = 1
-                    while stride < self.width:
-                        for start in range(0, self.width, stride * 2):
-                            left = partial[start]
-                            right = partial[start + stride]
-                            if left is None:
-                                partial[start] = right
-                            elif right is not None:
-                                left_value = _decode(left, out_type)
-                                right_value = _decode(right, out_type)
-                                value = left_value + right_value if op == Opcode.REDUCE_SUM else max(left_value, right_value)
-                                payload = (float_to_bf16(float(value)) if out_type == DataType.BF16
-                                           else _pack(int(value), out_type))
-                                partial[start] = _Register(payload, out_type)
-                        stride *= 2
-                    result = partial[0]
-                assert result is not None
+                    acc = 0
+                    for lane in active:
+                        av = int(_decode(self._rf[lane][insn.src_a], out_type))
+                        bv = int(_decode(self._rf[lane][insn.src_b], out_type))
+                        acc = int(acc) + int(av) * int(bv)
+                    result = _Register(_pack(int(acc), out_type), out_type)
                 for lane in active:
                     self._rf[lane][insn.dst] = _Register(result.payload, result.dtype)
             self.cycles += 1
@@ -347,6 +461,30 @@ class Tile:
                 if reg is None:
                     reg = _Register(0, a.dtype)
                 writes.append((lane, _Register(reg.payload, reg.dtype)))
+                continue
+            if op == Opcode.TRANSPOSE:
+                src_lane = self._permute_lane(lane, direction)
+                reg = self._rf[src_lane][insn.src_a]
+                writes.append((lane, _Register(reg.payload, reg.dtype)))
+                continue
+            if op == Opcode.ROW_BROADCAST:
+                src_lane = (lane // 16) * 16
+                reg = self._rf[src_lane][insn.src_a]
+                writes.append((lane, _Register(reg.payload, reg.dtype)))
+                continue
+            if op == Opcode.COL_BROADCAST:
+                src_lane = lane % 16
+                reg = self._rf[src_lane][insn.src_a]
+                writes.append((lane, _Register(reg.payload, reg.dtype)))
+                continue
+            if op == Opcode.GATHER:
+                slot = a.payload & (LOCAL_WORDS - 1)
+                reg = self._sram[lane][slot]
+                writes.append((lane, _Register(reg.payload, reg.dtype)))
+                continue
+            if op == Opcode.SCATTER:
+                slot = b.payload & (LOCAL_WORDS - 1)
+                self._sram[lane][slot] = _Register(a.payload, a.dtype)
                 continue
             if not _supports_dtype(op, out_type):
                 continue
@@ -389,11 +527,28 @@ class Tile:
                 result = av - bv
             elif op == Opcode.MUL:
                 result = av * bv
+            elif op == Opcode.DIV:
+                # Truncating integer division; division by zero yields 0.
+                if int(bv) == 0:
+                    result = 0
+                else:
+                    result = int(int(av) / int(bv)) if (int(av) % int(bv) == 0 or (int(av) < 0) == (int(bv) < 0)) else int(int(av) / int(bv))
+                    # Use truncating semantics via abs.
+                    result = abs(int(av)) // abs(int(bv))
+                    if (int(av) < 0) != (int(bv) < 0):
+                        result = -result
             elif op == Opcode.MAC:
                 accumulator = self._rf[lane][insn.dst]
                 if out_type == DataType.BF16:
                     old = _decode(accumulator, DataType.F32 if accumulator.dtype == DataType.F32 else DataType.BF16)
-                    result_bits = _f32_arithmetic_bits(float(old) + float(av) * float(bv))
+                    prod = f32_to_float(_f32_arithmetic_bits(float(av) * float(bv)))
+                    result_bits = _f32_arithmetic_bits(float(old) + float(prod))
+                    writes.append((lane, _Register(result_bits, DataType.F32)))
+                    continue
+                if out_type == DataType.F32:
+                    old = _decode(accumulator, DataType.F32)
+                    prod = f32_to_float(_f32_arithmetic_bits(float(av) * float(bv)))
+                    result_bits = _f32_arithmetic_bits(float(old) + float(prod))
                     writes.append((lane, _Register(result_bits, DataType.F32)))
                     continue
                 old = _decode(accumulator, out_type)
@@ -414,16 +569,16 @@ class Tile:
                 else:
                     result = a.payload >> shift
             elif op == Opcode.MIN:
-                result = math.nan if out_type == DataType.BF16 and (math.isnan(av) or math.isnan(bv)) else min(av, bv)
+                result = math.nan if out_type in (DataType.BF16, DataType.F32) and (math.isnan(float(av)) or math.isnan(float(bv))) else min(av, bv)
             elif op == Opcode.MAX:
-                result = math.nan if out_type == DataType.BF16 and (math.isnan(av) or math.isnan(bv)) else max(av, bv)
+                result = math.nan if out_type in (DataType.BF16, DataType.F32) and (math.isnan(float(av)) or math.isnan(float(bv))) else max(av, bv)
             else:
                 # Unknown v0 opcodes are defined as no-ops above.
                 continue
 
             payload = (float_to_bf16(float(result)) if out_type == DataType.BF16 else
-                       float_to_f32(float(result)) if out_type == DataType.F32 else
-                       _pack(int(result), out_type))
+                       (_f32_arithmetic_bits(float(result)) if out_type == DataType.F32 else
+                        _pack(int(result), out_type)))
             writes.append((lane, _Register(payload, out_type)))
 
         for lane, value in writes:
@@ -439,6 +594,28 @@ class Tile:
         dx, dy = dxdy[direction]
         nx, ny = x + dx, y + dy
         return ny * 16 + nx if 0 <= nx < 16 and 0 <= ny < 16 else None
+
+    @staticmethod
+    def _permute_lane(lane: int, kind: int) -> int:
+        x, y = lane % 16, lane // 16
+        kind &= 0x7
+        if kind == 0:  # transpose: (x,y) -> (y,x)
+            sx, sy = y, x
+        elif kind == 1:  # flip X
+            sx, sy = 15 - x, y
+        elif kind == 2:  # flip Y
+            sx, sy = x, 15 - y
+        elif kind == 3:  # rotate 90 CW: dest(x,y) <- src(y,15-x)
+            sx, sy = y, 15 - x
+        elif kind == 4:  # rotate 90 CCW: dest(x,y) <- src(15-y,x)
+            sx, sy = 15 - y, x
+        elif kind == 5:  # anti-transpose
+            sx, sy = 15 - y, 15 - x
+        elif kind == 6:  # rotate 180
+            sx, sy = 15 - x, 15 - y
+        else:  # identity
+            sx, sy = x, y
+        return sy * 16 + sx
 
 
 class Mesh:
