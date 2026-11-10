@@ -87,10 +87,11 @@ TT Liberty. The SRAM22 macro path was not re-run for v0.3.
 
 The area increase is about 63%, and the worst slack moves from met to a
 2.07 µs violation. The critical path is about 5,000 logic levels and is
-dominated by majority-gate (multiplier) cells. The likely source is the
-serial 16-term F32/BF16 `DOT_ROW` multiply-accumulate, which is computed
-combinationally in one `ST_EXEC` stage; the integer `DOT_ROW` multiply was
-restricted to 64-bit operands, but that alone did not change the worst path.
+dominated by majority-gate (adder) cells. A balanced-tree `DOT_ROW` (one
+multiplier plus four adder levels) was evaluated and slightly reduced the
+mapped area, but the worst slack was unchanged, so the serial `DOT_ROW` was
+kept. The remaining worst path is the `SCAN_SUM` serial prefix sum, which
+chains 16 `f32_add` (or integer add) operations in one combinational pass.
 `TRANSPOSE` (a 256:1 per-lane mux) and `GATHER`/`SCATTER` (per-lane SRAM
 address decode) also add combinational logic.
 
@@ -99,9 +100,31 @@ versions. The v0.2 baseline was re-run with the same local tools and gave
 780,712.52 µm², 102,690 instances, and 14.9190 ns slack (11.753 MHz), so the
 comparison is consistent.
 
-Pipelining the `DOT_ROW` accumulation (or reducing its serial depth) is
-required before v0.3 can meet a practical clock. The functional RTL, Python
-model, and RTL co-verification are unaffected: the v0.3 changes match the
+### SRAM22 macro path (v0.3)
+
+The SRAM22 path was re-run for v0.3 with the same generated 64×128-bit
+payload and 64×8-bit tag macros (two of each per PE).
+
+| Measurement | v0.3 macro path | v0.3 standard-cell |
+|---|---:|---:|
+| Standard-cell area | 1,134,722.04 µm² | 1,271,974.92 µm² |
+| SRAM macro area from LEF | 532,645.06 µm² | 0 µm² |
+| Combined cell + macro area | 1,667,367.10 µm² | 1,271,974.92 µm² |
+| Standard-cell sequential instances | 994 | 5,482 |
+| Physical SRAM macro instances | 4 | 0 |
+| Worst register-to-register slack at 100 ns | -2,000.6272 ns | -2,071.4563 ns |
+| Derived pre-layout Fmax | 0.476 MHz | 0.461 MHz |
+
+The macro path removes the register-file/SRAM flip-flops (994 sequential
+cells versus 5,482) and slightly shortens the critical path, but the combined
+area is about 31% higher than the standard-cell path and the Fmax is still
+impractical. The critical path remains the combinational `SCAN_SUM` prefix
+sum, not the memory arrays.
+
+Pipelining the `SCAN_SUM` prefix (or replacing it with a registered
+multi-cycle scan) is required before v0.3 can meet a practical clock. The
+functional RTL, Python model, and RTL co-verification are unaffected: the
+v0.3 changes match the
 Python model for all 8,192 state words.
 
 ## Timing and area interpretation
