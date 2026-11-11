@@ -39,10 +39,13 @@
   - [ ] 故障検出、迂回、タイル隔離、縮退動作は未設計。
 - [ ] v0.3のクリティカルパス改善
   - [x] 1 PE合成でcritical pathが約5,000段、maj3（加算器）支配であることを特定。
-  - [x] `DOT_ROW`の平衡ツリー版を評価。面積は小幅改善するがworst slackは不変のため直列版を維持。
-  - [x] SRAM22マクロパスのv0.3評価を実施（標準セル+マクロ合計1,667,367.10 µm²、Fmax 0.476 MHz）。
-  - [ ] 真のボトルネックは`SCAN_SUM`の直列prefix sum（16段のf32_add）。レジスタ型マルチサイクルscanまたは並列prefix scanに置き換える。
-  - [ ] `TRANSPOSE`/`GATHER`/`SCATTER`の組み合わせ論理を評価し、必要に応じてパイプライン化。
+  - [x] `SCAN_SUM`をKogge-Stone並列prefix scanへ、`DOT_ROW`を平衡ツリーへ置換。
+  - [x] SRAM22マクロパスのv0.3評価を実施。
+  - [x] ボトルネックを特定: main `always_comb` の per-lane 型/opcode選択（pre-mapのmuxが13,884個、v0.2の4,518個の約3倍）。
+  - [x] ABCの`dch`が合成のボトルネック（3,171秒）だったことを特定。`-script "+strash; dch -f; map"`に変更し、ABC 259秒・Fmax 0.452→1.290 MHz。
+  - [x] 1 PEフロー（LANES=1）はタイル横断命令のデータパスを最適化で落とすことを発見（`$mul`が11個のみ）。v0.3のPPA数値はper-laneのみ。
+  - [ ] main `always_comb` を decode / 演算 / writeback に分割してパイプライン化し、クリティカルパスを短縮する。
+  - [ ] タイル横断命令を消さない合成フローを用意し、v0.3全体のPPAを再測定する。
 
 ## 未着手 / 外部条件待ち
 

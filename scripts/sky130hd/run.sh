@@ -71,7 +71,7 @@ read_verilog -defer -sv rtl/grider_tile.sv
 hierarchy -check -chparam TILE_W 1 -chparam TILE_H 1 -chparam LANES 1 -top grider_tile
 synth -top grider_tile -noabc
 dfflibmap -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
-abc -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
+abc -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib -script "+strash; dch -f; map"
 clean
 tee -o build/sky130hd/mapped-stat.txt stat -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
 write_json build/sky130hd/mapped.json
@@ -105,7 +105,7 @@ read_liberty -lib build/sky130hd/sram22/sram22_64x8m4w8/sram22_64x8m4w8_tt_025C_
 hierarchy -check -chparam TILE_W 1 -chparam TILE_H 1 -chparam LANES 1 -top grider_tile
 synth -top grider_tile -noabc
 dfflibmap -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
-abc -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
+abc -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib -script "+strash; dch -f; map"
 clean
 tee -o build/sky130hd/macro-mapped-stat.txt stat -liberty build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
 write_json build/sky130hd/macro-mapped.json

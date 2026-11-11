@@ -74,31 +74,71 @@ The v0.3 ISA extensions (opcodes 21–30, F32 elementwise arithmetic, and the
 `DOT_ROW`/`TRANSPOSE`/`GATHER`/`SCATTER` datapaths) change the tile area and
 timing substantially. The same Sky130HD flow was run for one PE
 (`TILE_W=1`, `TILE_H=1`, `LANES=1`) with Yosys 0.52 and the pinned Sky130HD
-TT Liberty. The SRAM22 macro path was not re-run for v0.3.
+TT Liberty.
 
 | Measurement | v0.3 | v0.2 |
 |---|---:|---:|
-| Mapped standard-cell area | 1,271,974.92 µm² | 780,806.36 µm² |
-| Mapped standard-cell instances | 182,490 | 104,691 |
-| Sequential standard-cell instances | 5,482 | 5,477 |
-| Abstract 16×132 memories | 2 | 2 |
-| Worst register-to-register slack at 100 ns | -2,071.4563 ns | 10.2986 ns |
-| Derived pre-layout Fmax | 0.461 MHz | 11.148 MHz |
+| Mapped standard-cell area | 1,460,391.88 µm² | 859,346.68 µm² |
+| Mapped standard-cell instances | 269,110 | 146,906 |
+| Worst register-to-register slack at 100 ns | -674.9923 ns | 28.0014 ns |
+| Derived pre-layout Fmax | 1.290 MHz | 13.889 MHz |
 
-The area increase is about 63%, and the worst slack moves from met to a
-2.07 µs violation. The critical path is about 5,000 logic levels and is
-dominated by majority-gate (adder) cells. A balanced-tree `DOT_ROW` (one
-multiplier plus four adder levels) was evaluated and slightly reduced the
-mapped area, but the worst slack was unchanged, so the serial `DOT_ROW` was
-kept. The remaining worst path is the `SCAN_SUM` serial prefix sum, which
-chains 16 `f32_add` (or integer add) operations in one combinational pass.
-`TRANSPOSE` (a 256:1 per-lane mux) and `GATHER`/`SCATTER` (per-lane SRAM
-address decode) also add combinational logic.
+Both columns come from the same local tools and the same
+`abc -script "+strash; dch -f; map"` mapping script, so they are directly
+comparable. The v0.3 area is about 70% larger and the worst slack moves from
+met to a 0.67 µs violation. The earlier v0.2 numbers in this file
+(780,806.36 µm², 10.2986 ns slack, 11.148 MHz) were recorded with ABC's
+default mapping script and are kept below as the historical baseline.
 
-The v0.2 numbers above came from the CI flow with its own Yosys and OpenSTA
-versions. The v0.2 baseline was re-run with the same local tools and gave
-780,712.52 µm², 102,690 instances, and 14.9190 ns slack (11.753 MHz), so the
-comparison is consistent.
+### ABC mapping script
+
+The default ABC script spends almost all of the mapping time in `dch`, and on
+this design it also produces a worse result than the lower-effort variant.
+Three mappings of the same v0.3 netlist were compared:
+
+| ABC script | ABC time | Mapped area | Mapped cells | Worst slack | Fmax |
+|---|---:|---:|---:|---:|---:|
+| default (`dch`) | 3,171 s | 1,224,434.33 µm² | 174,263 | -2,114.2063 ns | 0.452 MHz |
+| `+strash; dch -f; map` | 259 s | 1,460,391.88 µm² | 269,110 | -674.9923 ns | 1.290 MHz |
+| `+strash; map` | 66 s | 2,322,578.79 µm² | 408,875 | -1,284.3201 ns | 0.674 MHz |
+
+`dch -f` is the operating point the flow now uses: it maps twelve times
+faster than the default script, gives the best timing of the three, and costs
+about 19% more area. It also keeps the synthesis job inside the CI timeout,
+which the default script no longer does for the v0.3 netlist.
+
+### What makes the v0.3 netlist heavy
+
+The pre-map netlist is dominated by multiplexers: 13,884 `$mux` cells out of
+17,235 total, against 4,518 out of 5,811 for v0.2. The growth is concentrated
+in the main `always_comb` block, where the per-lane type selection gained the
+F32 branch and the opcode `case` gained ten new operations. Each of those
+branches becomes another 128-bit-wide mux per lane.
+
+Two consequences follow:
+
+- **Synthesis time.** The mux network is what makes ABC slow; the `dch` pass
+  alone accounted for 3,171 s of the original run.
+- **Critical path.** The worst path runs from `operand_b[0]` to
+  `writeback_data_q[0]`: it is the per-lane result computation of the main
+  `always_comb` block, which selects between the BF16, F32, and integer
+  arithmetic and then between the opcode results, all in one combinational
+  pass. The path holds about 5,100 cells, of which about 2,100 are majority
+  gates, and several cells carry fanouts of 200 to 740 gates, which
+  dominates the delay.
+
+### One-PE flows cannot measure the tile-wide operations
+
+`REDUCE_SUM`, `REDUCE_SUM_COL`, `SCAN_SUM`, `DOT_ROW`, `TRANSPOSE`, and
+`GATHER`/`SCATTER` read `operand_a`/`operand_b` across all 256 cells. The
+Sky130HD flow elaborates one PE with `LANES=1`, so those array reads fall
+outside the declared `[0:LANES-1]` range and the synthesis folds their
+datapaths away: the v0.3 pre-map netlist contains only 11 `$mul` cells
+against 6 for v0.2, where a live `DOT_ROW` would add hundreds. The numbers
+above therefore describe the per-lane datapath only; the tile-wide
+operations are not included, and the v0.3 tile is larger and slower than the
+table suggests. A separate flow that keeps the tile-wide operations
+elaborated is needed before any whole-tile PPA claim can be made.
 
 ### SRAM22 macro path (v0.3)
 
@@ -107,31 +147,33 @@ payload and 64×8-bit tag macros (two of each per PE).
 
 | Measurement | v0.3 macro path | v0.3 standard-cell |
 |---|---:|---:|
-| Standard-cell area | 1,134,722.04 µm² | 1,271,974.92 µm² |
+| Standard-cell area | 1,495,927.21 µm² | 1,460,391.88 µm² |
 | SRAM macro area from LEF | 532,645.06 µm² | 0 µm² |
-| Combined cell + macro area | 1,667,367.10 µm² | 1,271,974.92 µm² |
-| Standard-cell sequential instances | 994 | 5,482 |
+| Combined cell + macro area | 2,028,572.27 µm² | 1,460,391.88 µm² |
+| Mapped standard-cell instances | 301,763 | 269,110 |
 | Physical SRAM macro instances | 4 | 0 |
-| Worst register-to-register slack at 100 ns | -2,000.6272 ns | -2,071.4563 ns |
-| Derived pre-layout Fmax | 0.476 MHz | 0.461 MHz |
+| Worst register-to-register slack at 100 ns | -667.6070 ns | -674.9923 ns |
+| Derived pre-layout Fmax | 1.303 MHz | 1.290 MHz |
 
 The macro path removes the register-file/SRAM flip-flops (994 sequential
-cells versus 5,482) and slightly shortens the critical path, but the combined
-area is about 31% higher than the standard-cell path and the Fmax is still
-impractical. The critical path remains the combinational `SCAN_SUM` prefix
-sum, not the memory arrays.
+cells against 5,482) and gives a marginally better clock, but the combined
+area is about 39% higher than the standard-cell path. The critical path is in
+the per-lane arithmetic, not the memory arrays.
 
-Pipelining the `SCAN_SUM` prefix (or replacing it with a registered
-multi-cycle scan) is required before v0.3 can meet a practical clock. The
+Pipelining the main `always_comb` block (splitting the decode from the
+arithmetic) is required before v0.3 can meet a practical clock; the
+per-operation work on `SCAN_SUM` and `DOT_ROW` cannot recover the clock on
+its own because those paths are not the worst case in this flow. The
 functional RTL, Python model, and RTL co-verification are unaffected: the
-v0.3 changes match the
-Python model for all 8,192 state words.
+v0.3 changes match the Python model for all 8,192 state words.
 
 ## Timing and area interpretation
 
 Yosys reports the sum of mapped standard-cell areas. The current netlist contains 5,477 sequential cells, including enabled flip-flops; the earlier count of 4,225 came from the old RTL. The current worst path has 88.3604 ns data arrival and 10.2986 ns slack. The RTL names are hidden in the STA netlist, so this report does not tie that path to a specific source signal.
 
-OpenSTA uses a 100 ns ideal clock, 100 ps clock transition, and zero clock uncertainty. Fmax is calculated as `1000 / (100 ns - worst slack)`. No placed design or extracted SPEF parasitics are supplied, so 11.148 MHz is a pre-layout estimate, not routed Fmax. The result covers one PE only; the default 16×16 tile and 2×2 mesh have not been synthesized for area or timing.
+OpenSTA uses a 100 ns ideal clock, 100 ps clock transition, and zero clock uncertainty. Fmax is calculated as `1000 / (100 ns - worst slack)`. No placed design or extracted SPEF parasitics are supplied, so the reported Fmax values are pre-layout estimates, not routed Fmax. The result covers one PE only; the default 16×16 tile and 2×2 mesh have not been synthesized for area or timing.
+
+The mapping step uses `abc -script "+strash; dch -f; map"`. ABC's default script spends almost all of its time in `dch` on the v0.3 netlist and returns a worse mapping than the lower-effort variant, so the flow pins the explicit script. The measurements above the "Timing and area interpretation" heading were taken with that script.
 
 The flow pins the Sky130HD timing Liberty to PDK repository commit `5a42fd01a0eeb2338340438443c7062e198d97a4` and the OpenROAD Flow container to image digest `sha256:6810dbf0e03dddbc89ed8c0a1e13cad09ce4c98d40c4ac0ab99fdc04b0676347`. The CI artifact contains the reports, Yosys JSON snapshots, and mapped Verilog.
 
