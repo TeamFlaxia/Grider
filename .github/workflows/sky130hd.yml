@@ -9,7 +9,7 @@ on:
 jobs:
   sky130hd-one-pe:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       SKY130HD_LIB: build/sky130hd/sky130_fd_sc_hd__tt_025C_1v80.lib
     steps:

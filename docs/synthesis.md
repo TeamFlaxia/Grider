@@ -83,12 +83,14 @@ TT Liberty.
 | Worst register-to-register slack at 100 ns | -674.9923 ns | 28.0014 ns |
 | Derived pre-layout Fmax | 1.290 MHz | 13.889 MHz |
 
-Both columns come from the same local tools and the same
+Both columns come from the same local tools (Yosys 0.52) and the same
 `abc -script "+strash; dch -f; map"` mapping script, so they are directly
 comparable. The v0.3 area is about 70% larger and the worst slack moves from
-met to a 0.67 µs violation. The earlier v0.2 numbers in this file
-(780,806.36 µm², 10.2986 ns slack, 11.148 MHz) were recorded with ABC's
-default mapping script and are kept below as the historical baseline.
+met to a 0.67 µs violation. The CI flow with Yosys 0.70 measures the same
+netlist at 1,480,468.64 µm², 268,375 instances, and -651.7817 ns slack
+(1.330 MHz). The earlier v0.2 numbers in this file (780,806.36 µm²,
+10.2986 ns slack, 11.148 MHz) were recorded with ABC's default mapping script
+and are kept below as the historical baseline.
 
 ### ABC mapping script
 
@@ -158,7 +160,9 @@ payload and 64×8-bit tag macros (two of each per PE).
 The macro path removes the register-file/SRAM flip-flops (994 sequential
 cells against 5,482) and gives a marginally better clock, but the combined
 area is about 39% higher than the standard-cell path. The critical path is in
-the per-lane arithmetic, not the memory arrays.
+the per-lane arithmetic, not the memory arrays. The CI flow measures the same
+macro path at 1,425,507.17 µm² of standard cells plus 532,645.06 µm² of
+macro area (1,958,152.23 µm² combined) with -605.0353 ns slack (1.418 MHz).
 
 Pipelining the main `always_comb` block (splitting the decode from the
 arithmetic) is required before v0.3 can meet a practical clock; the
