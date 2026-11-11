@@ -78,19 +78,17 @@ TT Liberty.
 
 | Measurement | v0.3 | v0.2 |
 |---|---:|---:|
-| Mapped standard-cell area | 1,460,391.88 µm² | 859,346.68 µm² |
-| Mapped standard-cell instances | 269,110 | 146,906 |
-| Worst register-to-register slack at 100 ns | -674.9923 ns | 28.0014 ns |
-| Derived pre-layout Fmax | 1.290 MHz | 13.889 MHz |
+| Mapped standard-cell area | 1,482,128.98 µm² | 859,346.68 µm² |
+| Mapped standard-cell instances | 270,366 | 146,906 |
+| Worst register-to-register slack at 100 ns | -690.1541 ns | 28.0014 ns |
+| Derived pre-layout Fmax | 1.266 MHz | 13.889 MHz |
 
 Both columns come from the same local tools (Yosys 0.52) and the same
 `abc -script "+strash; dch -f; map"` mapping script, so they are directly
-comparable. The v0.3 area is about 70% larger and the worst slack moves from
-met to a 0.67 µs violation. The CI flow with Yosys 0.70 measures the same
-netlist at 1,480,468.64 µm², 268,375 instances, and -651.7817 ns slack
-(1.330 MHz). The earlier v0.2 numbers in this file (780,806.36 µm²,
-10.2986 ns slack, 11.148 MHz) were recorded with ABC's default mapping script
-and are kept below as the historical baseline.
+comparable. The v0.3 area is about 72% larger and the worst slack moves from
+met to a 0.69 µs violation. The earlier v0.2 numbers in this file
+(780,806.36 µm², 10.2986 ns slack, 11.148 MHz) were recorded with ABC's
+default mapping script and are kept below as the historical baseline.
 
 ### ABC mapping script
 
@@ -125,9 +123,26 @@ Two consequences follow:
   `writeback_data_q[0]`: it is the per-lane result computation of the main
   `always_comb` block, which selects between the BF16, F32, and integer
   arithmetic and then between the opcode results, all in one combinational
-  pass. The path holds about 5,100 cells, of which about 2,100 are majority
-  gates, and several cells carry fanouts of 200 to 740 gates, which
-  dominates the delay.
+  pass. About 45% of its delay sits in cells with fanouts of 50 to 200, which
+  are the opcode and type select signals driving the 128-bit mux tree.
+
+### Arithmetic depth
+
+The floating-point helpers used to normalise a significand with an iterative
+shift loop: seven steps for bfloat16, twenty-three for binary32 multiply and
+twenty-seven for binary32 add. Every call site inlined that loop, and the
+synthesis merged the copies into one chain, so the helpers dominated the
+combinational depth. Replacing the loops with a leading-zero count plus one
+barrel shift, and replacing the sticky-bit loop in the right-shift helper with
+a mask, cut the longest topological path from 1,807 levels to 293 levels
+(6.2x) with no change in the arithmetic results: the Python model still
+matches the RTL bit for bit over all 8,192 state words.
+
+The measured Fmax barely moves, because the remaining path is no longer
+depth-limited but fanout-limited: the opcode and type selects drive hundreds
+of 128-bit-wide muxes each. Splitting that select network needs a per-lane
+pipeline register, which costs 256 lanes times 132 bits of extra flip-flops in
+the full tile, a cost the one-PE flow cannot show.
 
 ### One-PE flows cannot measure the tile-wide operations
 
@@ -149,26 +164,25 @@ payload and 64×8-bit tag macros (two of each per PE).
 
 | Measurement | v0.3 macro path | v0.3 standard-cell |
 |---|---:|---:|
-| Standard-cell area | 1,495,927.21 µm² | 1,460,391.88 µm² |
+| Standard-cell area | 1,415,224.81 µm² | 1,482,128.98 µm² |
 | SRAM macro area from LEF | 532,645.06 µm² | 0 µm² |
-| Combined cell + macro area | 2,028,572.27 µm² | 1,460,391.88 µm² |
-| Mapped standard-cell instances | 301,763 | 269,110 |
+| Combined cell + macro area | 1,947,869.87 µm² | 1,482,128.98 µm² |
+| Mapped standard-cell instances | 282,668 | 270,366 |
 | Physical SRAM macro instances | 4 | 0 |
-| Worst register-to-register slack at 100 ns | -667.6070 ns | -674.9923 ns |
-| Derived pre-layout Fmax | 1.303 MHz | 1.290 MHz |
+| Worst register-to-register slack at 100 ns | -635.3224 ns | -690.1541 ns |
+| Derived pre-layout Fmax | 1.361 MHz | 1.266 MHz |
 
 The macro path removes the register-file/SRAM flip-flops (994 sequential
 cells against 5,482) and gives a marginally better clock, but the combined
-area is about 39% higher than the standard-cell path. The critical path is in
-the per-lane arithmetic, not the memory arrays. The CI flow measures the same
-macro path at 1,425,507.17 µm² of standard cells plus 532,645.06 µm² of
-macro area (1,958,152.23 µm² combined) with -605.0353 ns slack (1.418 MHz).
+area is about 31% higher than the standard-cell path. The critical path is in
+the per-lane arithmetic, not the memory arrays.
 
-Pipelining the main `always_comb` block (splitting the decode from the
-arithmetic) is required before v0.3 can meet a practical clock; the
-per-operation work on `SCAN_SUM` and `DOT_ROW` cannot recover the clock on
-its own because those paths are not the worst case in this flow. The
-functional RTL, Python model, and RTL co-verification are unaffected: the
+The remaining bottleneck is the 128-bit-wide opcode and type select network in
+the main `always_comb` block, whose select signals carry fanouts of 50 to
+200. Breaking it needs a per-lane pipeline register between the arithmetic
+and the result selection, which costs 256 lanes times 132 bits of extra
+flip-flops in the full tile; the one-PE flow used here cannot show that cost.
+The functional RTL, Python model, and RTL co-verification are unaffected: the
 v0.3 changes match the Python model for all 8,192 state words.
 
 ## Timing and area interpretation

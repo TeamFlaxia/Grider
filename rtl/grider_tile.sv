@@ -551,26 +551,71 @@ module grider_tile #(
         end
     endfunction
 
+    // Leading-zero counts. An iterative shift loop would serialise one level
+    // per bit position and the copies would chain into the critical path.
+    function automatic logic [3:0] clz8(input logic [7:0] value);
+        logic [7:0] v;
+        logic [3:0] n;
+        begin
+            v = value;
+            n = 4'd0;
+            if (v[7:4] == 0) begin v = v << 4; n = n + 4; end
+            if (v[7:6] == 0) begin v = v << 2; n = n + 2; end
+            if (v[7] == 0)   begin v = v << 1; n = n + 1; end
+            clz8 = n;
+        end
+    endfunction
+
+    function automatic logic [4:0] clz24(input logic [23:0] value);
+        logic [23:0] v;
+        logic [4:0] n;
+        begin
+            v = value;
+            n = 5'd0;
+            if (v[23:12] == 0) begin v = v << 12; n = n + 12; end
+            if (v[23:18] == 0) begin v = v << 6;  n = n + 6;  end
+            if (v[23:21] == 0) begin v = v << 3;  n = n + 3;  end
+            if (v[23:22] == 0) begin v = v << 2;  n = n + 2;  end
+            if (v[23] == 0)    begin v = v << 1;  n = n + 1;  end
+            clz24 = n;
+        end
+    endfunction
+
+    function automatic logic [4:0] clz27(input logic [26:0] value);
+        logic [26:0] v;
+        logic [4:0] n;
+        begin
+            v = value;
+            n = 5'd0;
+            if (v[26:13] == 0) begin v = v << 14; n = n + 14; end
+            if (v[26:20] == 0) begin v = v << 7;  n = n + 7;  end
+            if (v[26:24] == 0) begin v = v << 3;  n = n + 3;  end
+            if (v[26:25] == 0) begin v = v << 2;  n = n + 2;  end
+            if (v[26] == 0)    begin v = v << 1;  n = n + 1;  end
+            clz27 = n;
+        end
+    endfunction
+
     function automatic logic [11:0] bf16_shift_right_sticky(
         input logic [11:0] value,
         input integer amount
     );
         logic [11:0] shifted;
+        logic [11:0] mask;
         logic discarded;
-        integer bit_index;
         begin
-            discarded = 1'b0;
             if (amount >= 12) begin
                 shifted = '0;
                 shifted[0] = |value;
             end else if (amount <= 0) begin
                 shifted = value;
             end else begin
+                // A mask selects the discarded bits in one step. A loop over
+                // the bit positions would serialise 12 levels of logic per
+                // call and the copies would chain into the critical path.
+                mask = (12'd1 << amount) - 12'd1;
+                discarded = |(value & mask);
                 shifted = value >> amount;
-                for (bit_index = 0; bit_index < 12; bit_index = bit_index + 1) begin
-                    if (bit_index < amount)
-                        discarded = discarded | value[bit_index];
-                end
                 shifted[0] = shifted[0] | discarded;
             end
             bf16_shift_right_sticky = shifted;
@@ -704,7 +749,8 @@ module grider_tile #(
         integer exp_a;
         integer exp_b;
         integer exponent;
-        integer normalize_step;
+        logic [3:0] shift_a;
+        logic [3:0] shift_b;
         logic sign_result;
         logic [7:0] sig_a;
         logic [7:0] sig_b;
@@ -716,10 +762,13 @@ module grider_tile #(
             exp_b = (b_value[14:7] == 0) ? 1 : b_value[14:7];
             sig_a = (a_value[14:7] == 0) ? {1'b0, a_value[6:0]} : {1'b1, a_value[6:0]};
             sig_b = (b_value[14:7] == 0) ? {1'b0, b_value[6:0]} : {1'b1, b_value[6:0]};
-            for (normalize_step = 0; normalize_step < 7; normalize_step = normalize_step + 1) begin
-                if ((sig_a != 0) && !sig_a[7]) begin sig_a = sig_a << 1; exp_a = exp_a - 1; end
-                if ((sig_b != 0) && !sig_b[7]) begin sig_b = sig_b << 1; exp_b = exp_b - 1; end
-            end
+            // Normalize with a leading-zero count and one barrel shift.
+            shift_a = (sig_a != 0) ? {1'b0, clz8(sig_a)} : 4'd0;
+            shift_b = (sig_b != 0) ? {1'b0, clz8(sig_b)} : 4'd0;
+            sig_a = sig_a << shift_a;
+            sig_b = sig_b << shift_b;
+            exp_a = exp_a - shift_a;
+            exp_b = exp_b - shift_b;
             product = sig_a * sig_b;
             if ((a_value[14:7] == 8'hff && a_value[6:0] != 0) ||
                 (b_value[14:7] == 8'hff && b_value[6:0] != 0)) begin
@@ -806,18 +855,20 @@ module grider_tile #(
         input integer amount
     );
         logic [26:0] shifted;
+        logic [26:0] mask;
         logic sticky;
-        integer shift_i;
         begin
             if (amount <= 0) begin
                 shifted = value;
             end else if (amount >= 27) begin
                 shifted = {26'b0, |value};
             end else begin
+                // A mask selects the discarded bits in one step. A loop over
+                // the bit positions would serialise 27 levels of logic per
+                // call and the copies would chain into the critical path.
+                mask = (27'd1 << amount) - 27'd1;
+                sticky = |(value & mask);
                 shifted = value >> amount;
-                sticky = 1'b0;
-                for (shift_i = 0; shift_i < 27; shift_i = shift_i + 1)
-                    if (shift_i < amount) sticky = sticky | value[shift_i];
                 shifted[0] = shifted[0] | sticky;
             end
             f32_shift_right_sticky = shifted;
@@ -875,7 +926,7 @@ module grider_tile #(
         logic [26:0] small_ext;
         logic [26:0] aligned_small;
         logic [27:0] work_ext;
-        integer norm_i;
+        integer norm_shift;
         begin
             sign_a = a_value[31];
             sign_b = b_value[31];
@@ -922,12 +973,13 @@ module grider_tile #(
                         work_ext = {1'b0, f32_shift_right_sticky(work_ext[26:0], 1)};
                         exponent = exponent + 1;
                     end else begin
-                        for (norm_i = 0; norm_i < 27; norm_i = norm_i + 1) begin
-                            if (!work_ext[26] && (exponent > 1)) begin
-                                work_ext = work_ext << 1;
-                                exponent = exponent - 1;
-                            end
-                        end
+                        // Normalize with a leading-zero count and one barrel
+                        // shift, bounded by the exponent range.
+                        norm_shift = clz27(work_ext[26:0]);
+                        if ((exponent - 1) < norm_shift) norm_shift = exponent - 1;
+                        if (norm_shift < 0) norm_shift = 0;
+                        work_ext = work_ext << norm_shift;
+                        exponent = exponent - norm_shift;
                     end
                     f32_add = f32_round_pack(sign_result, exponent, work_ext[26:0]);
                 end
@@ -945,7 +997,8 @@ module grider_tile #(
         integer exp_a;
         integer exp_b;
         integer exponent;
-        integer norm_i;
+        logic [4:0] shift_a;
+        logic [4:0] shift_b;
         logic [23:0] sig_a;
         logic [23:0] sig_b;
         logic [47:0] product;
@@ -958,16 +1011,13 @@ module grider_tile #(
             sig_b = {(exp_b_field != 0), b_value[22:0]};
             exp_a = (exp_a_field == 0) ? 1 : exp_a_field;
             exp_b = (exp_b_field == 0) ? 1 : exp_b_field;
-            for (norm_i = 0; norm_i < 23; norm_i = norm_i + 1) begin
-                if ((sig_a != 0) && !sig_a[23]) begin
-                    sig_a = sig_a << 1;
-                    exp_a = exp_a - 1;
-                end
-                if ((sig_b != 0) && !sig_b[23]) begin
-                    sig_b = sig_b << 1;
-                    exp_b = exp_b - 1;
-                end
-            end
+            // Normalize with a leading-zero count and one barrel shift.
+            shift_a = (sig_a != 0) ? clz24(sig_a) : 5'd0;
+            shift_b = (sig_b != 0) ? clz24(sig_b) : 5'd0;
+            sig_a = sig_a << shift_a;
+            sig_b = sig_b << shift_b;
+            exp_a = exp_a - shift_a;
+            exp_b = exp_b - shift_b;
             product = sig_a * sig_b;
             if (((exp_a_field == 8'hff) && (a_value[22:0] != 0)) ||
                 ((exp_b_field == 8'hff) && (b_value[22:0] != 0)) ||
